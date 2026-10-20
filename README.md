@@ -1,3 +1,19 @@
+# PNP Access Control — Dashboard Revision
+
+The new same-network prototype provides separate admin and monitoring dashboards backed by Django and local PostgreSQL. The MacBook hosts all services; other devices on the LAN use the admin website with application login.
+
+See [SETUP.md](SETUP.md) for installation, credentials, local HTTPS trust, starting/stopping services, enrollment, and backup instructions. See [IMPLEMENTATION.md](IMPLEMENTATION.md) for verified functionality and remaining hardware acceptance, and [plan.md](plan.md) for architecture and scope.
+
+```sh
+.venv/bin/python scripts/start.py
+```
+
+Admin: `https://localhost:8443/` · Monitor: `https://localhost:8443/monitor`
+
+The original Flask prototype and its instructions are preserved below. Avoid using both applications on the same physical webcam simultaneously.
+
+---
+
 # Face Studio — RetinaFace + ArcFace
 
 A local browser webcam app with multi-person recognition, face boxes, detection confidence, cosine similarity, and guided registration at five angles.

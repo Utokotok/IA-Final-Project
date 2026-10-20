@@ -9,3 +9,12 @@ registration/
 data/calibration/
 data/entries.jsonl
 data/recognition_settings.json
+
+# Dashboard revision runtime and builds
+runtime/
+frontend/node_modules/
+frontend/dist/
+.env
+*.pem
+
+.ruff_cache/

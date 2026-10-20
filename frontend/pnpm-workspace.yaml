@@ -1,0 +1,4 @@
+allowBuilds:
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@rollup/rollup-linux-arm64-gnu@4.64.8'

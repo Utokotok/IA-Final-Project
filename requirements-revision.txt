@@ -1,0 +1,6 @@
+-r requirements.txt
+Django>=5.2,<5.3
+djangorestframework>=3.16,<4
+psycopg[binary]>=3.2,<4
+whitenoise>=6.9,<7
+waitress>=3,<4
