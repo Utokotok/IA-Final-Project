@@ -33,6 +33,7 @@ from services.recognition.video_pipeline import (
     DEFAULTS,
     VideoPipeline,
     decision,
+    pose_guidance,
     quality_metrics,
     quality_weight,
     rejection,
@@ -40,6 +41,7 @@ from services.recognition.video_pipeline import (
 
 LOG = logging.getLogger("pnp.monitor")
 POSES = ["front", "left", "right", "up", "down"]
+TRACK_CONFIRMATION_TTL = 2.5
 
 
 def enrollment_result(frame, faces, recognizer, job):
@@ -814,9 +816,12 @@ class Monitor:
                 )
             history = self.samples[track]
             result = decision(history, people, self.settings, now, gallery=full_gallery)
-            if history and now - history[-1]["time"] > 1.15:
+            if history and now - history[-1]["time"] > TRACK_CONFIRMATION_TTL:
                 result["confirmed"] = False
 
+            effective_warning = warning or (
+                None if result["confirmed"] else pose_guidance(quality)
+            )
             elapsed = (now - self.first[track]) if is_triggered else 0.0
             outcome = evaluate_verification_outcome(
                 is_triggered=is_triggered,
@@ -824,7 +829,7 @@ class Monitor:
                 candidates=candidates,
                 visible_tags=self.visible,
                 result=result,
-                warning=warning,
+                warning=effective_warning,
                 fresh=fresh,
                 elapsed=elapsed,
                 threshold=self.settings["threshold"],
@@ -835,7 +840,7 @@ class Monitor:
                 self._record_event(track, frame, face, outcome, person, result, now)
 
             stage, label = resolve_overlay_stage(
-                outcome, person, is_triggered, gate, warning, candidates
+                outcome, person, is_triggered, gate, effective_warning, candidates
             )
             overlays.append(
                 dict(

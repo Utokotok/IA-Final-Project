@@ -63,11 +63,22 @@ class TemporalTests(unittest.TestCase):
         person_with_exemplars = dict(
             id='a',
             reference=self.owner,
-            exemplars=[self.owner, self.other],
+            exemplars=[self.owner, self.other, self.unknown],
         )
         side_samples = self.samples(self.other, 4)
+        for sample in side_samples:
+            sample['quality']['yaw'] = 0.48
+            sample['quality']['confidence'] = 0.75
         self.assertTrue(
             decision(side_samples, [person_with_exemplars], DEFAULTS, 0.8)['confirmed']
+        )
+        # Rotating head across 3 orthogonal pose exemplars confirms via per-sample exemplar scoring
+        rotating_samples = [
+            dict(embedding=vec, quality=dict(self.quality, yaw=0.45, confidence=0.76), time=i * 0.2, track=1)
+            for i, vec in enumerate([self.owner, self.other, self.unknown])
+        ]
+        self.assertTrue(
+            decision(rotating_samples, [person_with_exemplars], DEFAULTS, 0.6)['confirmed']
         )
 
     def test_one_log_per_track_and_gallery_deletion(self):

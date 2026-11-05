@@ -249,6 +249,45 @@ class VerificationDecisionTests(unittest.TestCase):
         self.assertFalse(gate["kinematics_ready"])
         self.assertFalse(gate["triggered"])
 
+    def test_side_face_exemplar_verifies_without_blocking_inference(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as d:
+            side_vec = [0.0, 1.0] + [0.0] * 510
+            p = dict(
+                id="person",
+                name="Officer",
+                personnel_id="P01",
+                ble_tag="tag",
+                reference=[1.0] + [0.0] * 511,
+                exemplars=[[1.0] + [0.0] * 511, side_vec],
+            )
+            m = self.make_monitor(d, [p])
+            m.recognizer.feature.return_value = np.array(side_vec, dtype=np.float32)
+            side_metrics = dict(
+                sharpness=100,
+                size=150,
+                yaw=0.48,
+                brightness=100,
+                confidence=0.76,
+                overexposed=0,
+            )
+            with (
+                patch("services.recognition.worker.quality_metrics", return_value=side_metrics),
+                patch(
+                    "services.recognition.worker.time.monotonic",
+                    side_effect=[t for t in [10, 10.2, 10.4] for _ in range(3)],
+                ),
+            ):
+                m.process(np.zeros((240, 320, 3), np.uint8))
+                # Before reaching min_samples=3, soft yaw guidance is shown while inference runs
+                self.assertEqual(m.overlays[0]["label"], "Turn your face toward the camera.")
+                m.process(np.zeros((240, 320, 3), np.uint8))
+                m.process(np.zeros((240, 320, 3), np.uint8))
+            self.assertEqual(m.latest["outcome"], "verified")
+            self.assertTrue(m.overlays[0]["confirmed"])
+            self.assertEqual(m.overlays[0]["label"], "Officer")
+
 
 class PreviewTests(unittest.TestCase):
     def test_buffer_keeps_latest_frame_instead_of_a_queue(self):
