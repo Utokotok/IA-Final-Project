@@ -242,6 +242,52 @@ class FrameBuffer:
             )
 
 
+def evaluate_hybrid_gate(face, frame_shape, trajectory, settings, now):
+    """Evaluate the 3-way walk-through hybrid gate: kinematics + optical scale."""
+    x, y, w, h = map(float, face[:4])
+    frame_h, frame_w = float(frame_shape[0]), float(frame_shape[1])
+    face_size = min(w, h)
+    cx_norm = (x + w * 0.5) / max(frame_w, 1.0)
+    cy_norm = (y + h * 0.5) / max(frame_h, 1.0)
+
+    if not trajectory or now - trajectory[-1]["time"] >= 0.04:
+        trajectory.append(dict(time=now, cx=cx_norm, cy=cy_norm, size=face_size))
+    while len(trajectory) > 1 and now - trajectory[0]["time"] > 1.2:
+        trajectory.popleft()
+
+    lateral_velocity = 0.0
+    scale_velocity = 0.0
+    if len(trajectory) >= 2:
+        anchor = trajectory[0]
+        dt = now - anchor["time"]
+        if dt >= 0.08:
+            lateral_velocity = abs(cx_norm - anchor["cx"]) / dt
+            scale_velocity = (face_size - anchor["size"]) / dt
+
+    in_corridor = 0.06 <= cx_norm <= 0.94
+    is_lateral_passerby = lateral_velocity > 0.45 and scale_velocity < 12.0
+    is_receding = scale_velocity < -25.0
+    kinematics_ready = in_corridor and not is_lateral_passerby and not is_receding
+
+    min_trigger_size = float(settings.get("min_size", 100.0))
+    scale_ready = face_size >= min_trigger_size
+    distance_m = round(
+        max(0.4, min(4.5, (min_trigger_size * 1.2) / max(face_size, 25.0))), 1
+    )
+
+    return dict(
+        face_size=round(face_size, 1),
+        distance_m=distance_m,
+        scale_ready=scale_ready,
+        kinematics_ready=kinematics_ready,
+        is_lateral_passerby=is_lateral_passerby,
+        is_receding=is_receding,
+        lateral_velocity=round(lateral_velocity, 3),
+        scale_velocity=round(scale_velocity, 1),
+        triggered=bool(scale_ready and kinematics_ready),
+    )
+
+
 class Monitor:
     def __init__(self, runtime, token):
         self.runtime = runtime
@@ -283,6 +329,7 @@ class Monitor:
         )
         self.outbox = Outbox(runtime / "outbox.sqlite3")
         self.samples = defaultdict(lambda: deque(maxlen=24))
+        self.trajectories = defaultdict(lambda: deque(maxlen=16))
         self.first = {}
         self.logged = set()
         self.session = uuid.uuid4().hex
@@ -437,6 +484,7 @@ class Monitor:
             self.gallery = data["people"]
             self.gallery_version = data["version"]
             self.samples.clear()
+            self.trajectories.clear()
             self.best_captures.clear()
             self.first.clear()
             self.logged.clear()
@@ -466,6 +514,7 @@ class Monitor:
         new_direction = result.get("direction", "entry")
         if new_direction != self.direction:
             self.samples.clear()
+            self.trajectories.clear()
             self.best_captures.clear()
             self.first.clear()
             self.logged.clear()
@@ -524,17 +573,28 @@ class Monitor:
             self.overlay_size = [frame.shape[1], frame.shape[0]]
             self.overlay_time = time.monotonic()
         overlays = []
-        for track in list(self.first):
+        trajectories = getattr(self, "trajectories", None)
+        if trajectories is None:
+            trajectories = self.trajectories = defaultdict(lambda: deque(maxlen=16))
+        for track in list(self.first) + list(trajectories):
             if track not in self.pipeline.last_seen:
                 self.first.pop(track, None)
                 self.samples.pop(track, None)
+                trajectories.pop(track, None)
                 self.best_captures.pop(track, None)
                 self.logged.discard(track)
         for index, face in enumerate(faces):
             track = assign.get(index)
             if track is None:
                 continue
-            self.first.setdefault(track, now)
+            gate = evaluate_hybrid_gate(
+                face, frame.shape, trajectories[track], self.settings, now
+            )
+            is_triggered = gate["triggered"]
+            if is_triggered:
+                self.first.setdefault(track, now)
+            else:
+                self.first.pop(track, None)
             quality = quality_metrics(frame, face)
             warning = rejection(quality, self.settings)
             history = self.samples[track]
@@ -546,7 +606,7 @@ class Monitor:
                 self.best_captures.clear()
                 history = self.samples[track]
                 self.candidate_signature = signature
-            if warning is None:
+            if warning is None and gate["kinematics_ready"]:
                 v = self.recognizer.feature(
                     self.recognizer.alignCrop(frame, face)
                 ).flatten()
@@ -578,20 +638,22 @@ class Monitor:
             fresh = now - self.last_gallery < 30
             outcome = None
             person = candidates[0] if len(candidates) == 1 else None
-            if len(faces) > 1 or len(candidates) > 1:
-                if now - self.first[track] > 2:
-                    outcome = "ambiguous"
-            elif len(candidates) == 1 and result["confirmed"] and fresh:
-                outcome = "verified"
-            elif now - self.first[track] > 4:
-                if not fresh:
-                    outcome = "service_unavailable"
-                elif not candidates:
-                    outcome = "missing_ble" if not self.visible else "unknown_tag"
-                elif warning:
-                    outcome = "timeout"
-                else:
-                    outcome = "face_mismatch"
+
+            if is_triggered:
+                if len(faces) > 1 or len(candidates) > 1:
+                    if now - self.first[track] > 2:
+                        outcome = "ambiguous"
+                elif len(candidates) == 1 and result["confirmed"] and fresh:
+                    outcome = "verified"
+                elif now - self.first[track] > 4:
+                    if not fresh:
+                        outcome = "service_unavailable"
+                    elif not candidates:
+                        outcome = "missing_ble" if not self.visible else "unknown_tag"
+                    elif warning:
+                        outcome = "timeout"
+                    else:
+                        outcome = "face_mismatch"
             if not self.current_processing_session():
                 return
             if outcome and track not in self.logged:
@@ -659,17 +721,40 @@ class Monitor:
                     unit=person.get("unit", "") if person else "",
                     ble_tag=person.get("ble_tag") if person else None,
                 )
-            label = (
-                person["name"]
-                if outcome == "verified"
-                else warning
-                or ("Verifying" if candidates else "Waiting for assigned BLE tag")
-            )
+            if outcome == "verified" and person:
+                stage = "verified"
+                label = person["name"]
+            elif outcome:
+                stage = "denied"
+                label = warning or (
+                    "Verifying" if candidates else "Waiting for assigned BLE tag"
+                )
+            elif is_triggered:
+                stage = "evaluating"
+                label = warning or (
+                    "Verifying" if candidates else "Waiting for assigned BLE tag"
+                )
+            elif not gate["kinematics_ready"]:
+                stage = "bystander"
+                label = (
+                    "Passerby ignored"
+                    if gate["is_lateral_passerby"]
+                    else "Outside approach zone"
+                )
+            else:
+                stage = "approaching"
+                label = f"Approaching · {gate['distance_m']:.1f}m"
+
             overlays.append(
                 dict(
                     box=face[:4].astype(float).tolist(),
                     label=label,
                     confirmed=outcome == "verified",
+                    triggered=is_triggered,
+                    stage=stage,
+                    distance_m=gate["distance_m"],
+                    scale_ready=gate["scale_ready"],
+                    kinematics_ready=gate["kinematics_ready"],
                 )
             )
         if not self.current_processing_session():

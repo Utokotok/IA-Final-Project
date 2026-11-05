@@ -150,6 +150,32 @@ class VerificationDecisionTests(unittest.TestCase):
             self.exercise(m, [13])
             self.assertEqual(m.latest["outcome"], "ambiguous")
 
+    def test_distant_face_stays_in_approaching_state_without_premature_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = self.make_monitor(d, [])
+            distant_face = np.zeros(15, np.float32)
+            distant_face[:4] = [120, 60, 65, 65]
+            distant_face[14] = 0.99
+            m.detector.detect.return_value = (None, np.array([distant_face]))
+            self.exercise(m, [10, 12, 16])
+            self.assertIsNone(m.latest)
+            self.assertEqual(m.overlays[0]["stage"], "approaching")
+            self.assertFalse(m.overlays[0]["triggered"])
+
+    def test_lateral_bystander_is_ignored_by_velocity_gate(self):
+        from collections import deque
+        from revision.worker import evaluate_hybrid_gate
+
+        trajectory = deque(maxlen=16)
+        settings = {"min_size": 100.0}
+        f1 = np.array([40, 60, 120, 120] + [0] * 11, dtype=np.float32)
+        f2 = np.array([220, 60, 120, 120] + [0] * 11, dtype=np.float32)
+        evaluate_hybrid_gate(f1, (240, 320, 3), trajectory, settings, 10.0)
+        gate = evaluate_hybrid_gate(f2, (240, 320, 3), trajectory, settings, 10.2)
+        self.assertTrue(gate["is_lateral_passerby"])
+        self.assertFalse(gate["kinematics_ready"])
+        self.assertFalse(gate["triggered"])
+
 
 class PreviewTests(unittest.TestCase):
     def test_buffer_keeps_latest_frame_instead_of_a_queue(self):
