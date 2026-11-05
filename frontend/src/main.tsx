@@ -2560,6 +2560,13 @@ function Monitor({ user, go, logout }: any) {
     }
   }
   const event = state?.latest;
+  const overlayW = state?.overlay_size?.[0] || 1280;
+  const overlayH = state?.overlay_size?.[1] || 720;
+  const overlays: any[] = state?.overlays || [];
+  const primaryFace = overlays[0] || null;
+  const gateTriggered =
+    overlays.some((f: any) => f.triggered) || event?.outcome === "verified";
+
   return (
     <div className="monitor-page">
       <div className="monitor-header">
@@ -2590,9 +2597,8 @@ function Monitor({ user, go, logout }: any) {
           <div>
             <h2>Live gate verification</h2>
             <p>
-              BLE identity is verified first; face recognition provides final
-              confirmation. The camera stops when the last monitoring tab
-              closes.
+              Walk-through 3-layer verification: approach trajectory, optical
+              face scale, and BLE proximity confirm identity on the move.
             </p>
           </div>
           <div className="button-row">
@@ -2670,38 +2676,63 @@ function Monitor({ user, go, logout }: any) {
                 />
                 <svg
                   className="recognition-overlay"
-                  viewBox={`0 0 ${state.overlay_size?.[0] || 1280} ${state.overlay_size?.[1] || 720}`}
+                  viewBox={`0 0 ${overlayW} ${overlayH}`}
                   preserveAspectRatio="xMidYMid meet"
                   aria-label="Recognition overlays"
                 >
-                  {(state.overlays || []).map((face, i) => (
-                    <g
-                      key={i}
-                      className={
-                        face.confirmed ? "face-confirmed" : "face-pending"
-                      }
-                    >
-                      <rect
-                        x={face.box[0]}
-                        y={face.box[1]}
-                        width={face.box[2]}
-                        height={face.box[3]}
-                      />
-                      <text
-                        x={Math.max(0, face.box[0])}
-                        y={Math.max(22, face.box[1] - 10)}
-                      >
-                        {face.label}
-                      </text>
-                    </g>
-                  ))}
+                  {overlays.map((face, i) => {
+                    const [x, y, w, h] = face.box;
+                    const c = Math.min(
+                      26,
+                      Math.max(12, Math.round(Math.min(w, h) * 0.18)),
+                    );
+                    const cornerPath = [
+                      `M ${x} ${y + c} L ${x} ${y} L ${x + c} ${y}`,
+                      `M ${x + w - c} ${y} L ${x + w} ${y} L ${x + w} ${y + c}`,
+                      `M ${x} ${y + h - c} L ${x} ${y + h} L ${x + c} ${y + h}`,
+                      `M ${x + w - c} ${y + h} L ${x + w} ${y + h} L ${x + w} ${y + h - c}`,
+                    ].join(" ");
+                    const stageClass = face.confirmed
+                      ? "face-confirmed"
+                      : face.stage === "denied"
+                        ? "face-pending"
+                        : face.stage === "bystander"
+                          ? "face-bystander"
+                          : face.triggered
+                            ? "face-evaluating"
+                            : "face-approaching";
+                    const pillText =
+                      face.triggered && typeof face.distance_m === "number"
+                        ? `${face.label} · ${face.distance_m.toFixed(1)}m`
+                        : face.label;
+                    const labelY = Math.max(24, y - 10);
+                    return (
+                      <g key={i} className={`face-reticle ${stageClass}`}>
+                        <rect
+                          x={x}
+                          y={y}
+                          width={w}
+                          height={h}
+                          rx="6"
+                          className="reticle-box"
+                        />
+                        <path d={cornerPath} className="reticle-corners" />
+                        <text x={Math.max(8, x)} y={labelY}>
+                          {pillText}
+                        </text>
+                      </g>
+                    );
+                  })}
                 </svg>
               </>
             ) : (
               <div className="monitor-empty">
                 <span>◎</span>
                 <h2>Ready to monitor</h2>
-                <p>Start the camera on this MacBook to begin verification.</p>
+                <p>
+                  Start the camera on this station to begin walk-through
+                  verification.
+                </p>
               </div>
             )}
             <div className="feed-top">
@@ -2737,16 +2768,35 @@ function Monitor({ user, go, logout }: any) {
               {event && <Badge value={event.outcome} />}
             </div>
             <div className="sequence">
-              <h4>VERIFICATION SEQUENCE</h4>
+              <h4>3-LAYER HYBRID VERIFICATION</h4>
               <div className="check-row">
-                <span className={state?.tags?.length ? "" : "pending"}>
-                  {state?.tags?.length ? "✓" : "1"}
+                <span className={gateTriggered ? "" : "pending"}>
+                  {gateTriggered ? "✓" : "1"}
                 </span>
                 <div>
-                  <b>BLE beacon detected</b>
-                  <small>
+                  <b>Approach & optical scale</b>
+                  <small className="tabular-nums">
+                    {primaryFace?.triggered
+                      ? `In trigger zone (${primaryFace.distance_m?.toFixed(1) || "1.0"}m) · Forward trajectory`
+                      : primaryFace?.stage === "bystander"
+                        ? "Lateral passerby filtered"
+                        : primaryFace
+                          ? `Approaching (${primaryFace.distance_m?.toFixed(1) || "1.8"}m) · Walk toward gate`
+                          : event?.outcome === "verified"
+                            ? "Walk-through approach confirmed"
+                            : "Waiting for entrant within 1.2m range"}
+                  </small>
+                </div>
+              </div>
+              <div className="check-row">
+                <span className={state?.tags?.length ? "" : "pending"}>
+                  {state?.tags?.length ? "✓" : "2"}
+                </span>
+                <div>
+                  <b>BLE proximity credential</b>
+                  <small className="tabular-nums">
                     {state?.tags
-                      ?.map((t) => `${t.tag} · ${t.rssi} dBm`)
+                      ?.map((t: any) => `${t.tag} · ${t.rssi} dBm`)
                       .join(", ") || "Waiting for an assigned tag"}
                   </small>
                 </div>
@@ -2755,14 +2805,14 @@ function Monitor({ user, go, logout }: any) {
                 <span
                   className={event?.outcome === "verified" ? "" : "pending"}
                 >
-                  {event?.outcome === "verified" ? "✓" : "2"}
+                  {event?.outcome === "verified" ? "✓" : "3"}
                 </span>
                 <div>
-                  <b>Face recognition confirmed</b>
+                  <b>Biometric face match</b>
                   <small>
                     {event?.outcome === "verified"
-                      ? event.name
-                      : "Waiting for a clear matching face"}
+                      ? `${event.name} (${typeof event.similarity === "number" ? event.similarity.toFixed(3) : "matched"})`
+                      : "Waiting for multi-frame face consensus"}
                   </small>
                 </div>
               </div>

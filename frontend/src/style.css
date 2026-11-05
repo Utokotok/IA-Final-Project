@@ -1470,30 +1470,65 @@ hr {
   height: 100%;
   pointer-events: none;
 }
-.recognition-overlay rect {
+.recognition-overlay .reticle-box {
   fill: none;
-  stroke-width: 2;
+  stroke-width: 1.5;
+  stroke-opacity: 0.45;
+  vector-effect: non-scaling-stroke;
+}
+.recognition-overlay .reticle-corners {
+  fill: none;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
 }
 .recognition-overlay text {
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   stroke: #101d2c;
   stroke-width: 3px;
   paint-order: stroke;
   stroke-linejoin: round;
 }
-.face-confirmed rect {
-  stroke: #abe195;
+.face-confirmed .reticle-box,
+.face-confirmed .reticle-corners {
+  stroke: #22c55e;
 }
 .face-confirmed text {
-  fill: #abe195;
+  fill: #86efac;
 }
-.face-pending rect {
-  stroke: #f29b9b;
+.face-pending .reticle-box,
+.face-pending .reticle-corners {
+  stroke: #ef4444;
 }
 .face-pending text {
-  fill: #f29b9b;
+  fill: #fca5a5;
+}
+.face-evaluating .reticle-box,
+.face-evaluating .reticle-corners {
+  stroke: #38bdf8;
+}
+.face-evaluating text {
+  fill: #bae6fd;
+}
+.face-approaching .reticle-box,
+.face-approaching .reticle-corners {
+  stroke: #f59e0b;
+}
+.face-approaching text {
+  fill: #fde68a;
+}
+.face-bystander .reticle-box,
+.face-bystander .reticle-corners {
+  stroke: #94a3b8;
+}
+.face-bystander text {
+  fill: #cbd5e1;
+}
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }
 
 /* Registration frames: Figma 1:2457, 1:2658, 1:3311. */
