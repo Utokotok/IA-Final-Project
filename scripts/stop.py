@@ -1,37 +1,49 @@
 #!/usr/bin/env python3
+"""Cross-platform service shutdown for PNP Access Control."""
+
 import os
 import signal
 import subprocess
+import sys
 from pathlib import Path
 
-runtime = Path(__file__).resolve().parents[1] / "runtime"
+RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
+
+
+def stop_process(pid: int):
+    if sys.platform == "win32":
+        try:
+            # /F force, /T tree kill
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+    else:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (OSError, AttributeError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
 for name in ["https", "recognition", "backend"]:
-    file = runtime / (name + ".pid")
-    if not file.exists():
+    pidfile = RUNTIME / f"{name}.pid"
+    if not pidfile.exists():
         continue
     try:
-        pid = int(file.read_text())
-        command = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout
-        expected = (
-            str(runtime / "Caddyfile")
-            if name == "https"
-            else str(
-                runtime.parent
-                / (
-                    ".venv/bin/waitress-serve"
-                    if name == "backend"
-                    else "revision/worker.py"
-                )
-            )
-        )
-        if expected in command:
-            os.killpg(pid, signal.SIGTERM)
+        pid = int(pidfile.read_text().strip())
+        stop_process(pid)
     except (OSError, ValueError):
         pass
-    file.unlink(missing_ok=True)
-print("Application services stopped. PostgreSQL remains available for maintenance.")
+    pidfile.unlink(missing_ok=True)
+
+print("Application services stopped.")

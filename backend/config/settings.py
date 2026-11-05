@@ -18,7 +18,11 @@ if not SECRET_KEY:
 SERVICE_TOKEN = os.environ.get("PNP_SERVICE_TOKEN", config.get("service_token", ""))
 DEBUG = False
 ALLOWED_HOSTS = config.get("hosts", ["localhost", "127.0.0.1", "testserver"])
-CSRF_TRUSTED_ORIGINS = [f"https://{h}:8443" for h in ALLOWED_HOSTS if h != "testserver"]
+CSRF_TRUSTED_ORIGINS = [
+    f"https://{h}:8443" for h in ALLOWED_HOSTS if h != "testserver"
+] + [
+    f"http://{h}:8000" for h in ALLOWED_HOSTS if h != "testserver"
+]
 INSTALLED_APPS = [
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -51,7 +55,17 @@ DATABASES = {
         "CONN_MAX_AGE": 30,
     }
 }
-if os.environ.get("PNP_TEST_SQLITE") == "1":
+if config.get("database_engine") == "sqlite3" or os.environ.get("PNP_DATABASE_SQLITE") == "1":
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": RUNTIME / "db.sqlite3",
+            "OPTIONS": {
+                "timeout": 30,
+            },
+        }
+    }
+elif os.environ.get("PNP_TEST_SQLITE") == "1":
     DATABASES = {
         "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}
     }
@@ -69,10 +83,11 @@ LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Asia/Manila"
 USE_TZ = True
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-SESSION_COOKIE_SECURE = True
+IS_HTTPS = config.get("https", True) and os.environ.get("PNP_INSECURE_HTTP") != "1"
+SESSION_COOKIE_SECURE = IS_HTTPS
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "Lax"
-CSRF_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = IS_HTTPS
 SESSION_COOKIE_AGE = 8 * 3600
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"
