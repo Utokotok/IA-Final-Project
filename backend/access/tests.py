@@ -9,7 +9,7 @@ from django.test import Client, TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from face_models import MODEL_ID
+from services.recognition.face_models import MODEL_ID
 
 from .models import (
     Enrollment,

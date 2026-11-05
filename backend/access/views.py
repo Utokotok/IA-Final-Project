@@ -41,8 +41,8 @@ from rest_framework.parsers import BaseParser
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
-from face_models import MODEL_ID
-from revision.photos import decode_image
+from services.recognition.face_models import MODEL_ID, pose_exemplars, reference_embedding
+from services.recognition.photos import decode_image
 
 from .models import (
     AuditEvent,
@@ -114,22 +114,29 @@ def gallery():
     ):
         if not hasattr(p, "profile") or p.profile.model_id != MODEL_ID:
             continue
-        rows.append(
-            dict(
-                id=str(p.id),
-                name=p.name,
-                personnel_id=p.personnel_id,
-                rank=p.rank,
-                unit=p.unit,
-                ble_tag=p.ble_tag,
-                reference=p.profile.reference,
-                profile_version=str(p.profile.version),
-                photo_available=p.reference_photo_available,
-                registered_at=p.profile.photo_taken_at.isoformat()
-                if p.profile.photo_taken_at
-                else None,
-            )
+        exemplars = None
+        if p.profile.features and len(p.profile.features) >= 8:
+            try:
+                exemplars = pose_exemplars(p.profile.features).tolist()
+            except ValueError:
+                exemplars = None
+        row = dict(
+            id=str(p.id),
+            name=p.name,
+            personnel_id=p.personnel_id,
+            rank=p.rank,
+            unit=p.unit,
+            ble_tag=p.ble_tag,
+            reference=p.profile.reference,
+            profile_version=str(p.profile.version),
+            photo_available=p.reference_photo_available,
+            registered_at=p.profile.photo_taken_at.isoformat()
+            if p.profile.photo_taken_at
+            else None,
         )
+        if exemplars is not None:
+            row["exemplars"] = exemplars
+        rows.append(row)
     rows.sort(key=lambda p: p["id"])
     version = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
     return dict(people=rows, version=version, model_id=MODEL_ID)
@@ -315,8 +322,7 @@ def enrollment(request, pk):
             import numpy as np
 
             features = np.asarray([s.embedding for s in samples], dtype=np.float32)
-            reference = features.mean(0)
-            reference /= max(float(np.linalg.norm(reference)), 1e-8)
+            reference = reference_embedding(features)
             vector(reference.tolist())
             photo, photo_taken_at = registration_photo(e.person)
             if photo is None:

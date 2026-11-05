@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.db.models import BooleanField, Case, Value, When
 
-from revision.photos import normalize_image
+from services.recognition.photos import normalize_image
 
 from .models import Sample, Verification
 

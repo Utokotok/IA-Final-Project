@@ -9,8 +9,8 @@ import uuid
 
 import numpy as np
 
-from face_models import MODEL_ID
-from video_pipeline import DEFAULTS, decision, gallery_signature, rejection
+from services.recognition.face_models import MODEL_ID
+from services.recognition.video_pipeline import DEFAULTS, decision, gallery_signature, rejection
 
 
 def atomic_json(path, value):

@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import numpy as np
 
-from revision.worker import Outbox, enrollment_result, pose_matches
+from services.recognition.worker import Outbox, enrollment_result, pose_matches
 
 
 class WorkerTests(unittest.TestCase):
@@ -48,8 +48,8 @@ class VerificationDecisionTests(unittest.TestCase):
         import threading
         from collections import defaultdict, deque
 
-        from revision.worker import Monitor
-        from video_pipeline import DEFAULTS
+        from services.recognition.worker import Monitor
+        from services.recognition.video_pipeline import DEFAULTS
 
         m = Monitor.__new__(Monitor)
         m.detector = Mock()
@@ -94,9 +94,9 @@ class VerificationDecisionTests(unittest.TestCase):
             overexposed=0,
         )
         with (
-            patch("revision.worker.quality_metrics", return_value=metrics),
+            patch("services.recognition.worker.quality_metrics", return_value=metrics),
             patch(
-                "revision.worker.time.monotonic",
+                "services.recognition.worker.time.monotonic",
                 side_effect=[t for t in times for _ in range(3)],
             ),
         ):
@@ -116,6 +116,57 @@ class VerificationDecisionTests(unittest.TestCase):
             self.exercise(m, [10, 10.2, 10.4])
             self.assertEqual(m.latest["outcome"], "verified")
             self.assertEqual(m.outbox.count(), 1)
+
+    def test_matching_face_above_threshold_times_out_not_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = dict(
+                id="person",
+                name="Officer",
+                personnel_id="P01",
+                ble_tag="tag",
+                reference=[1.0] + [0.0] * 511,
+            )
+            m = self.make_monitor(d, [p])
+            # Only 1 sample given at t=10; at t=15 (>4s) verification checks did not reach 3 samples
+            self.exercise(m, [10, 15])
+            self.assertEqual(m.latest["outcome"], "timeout")
+            self.assertGreaterEqual(m.latest["similarity"], 0.60)
+
+    def test_unmatching_face_results_in_face_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = dict(
+                id="person",
+                name="Officer",
+                personnel_id="P01",
+                ble_tag="tag",
+                reference=[1.0] + [0.0] * 511,
+            )
+            m = self.make_monitor(d, [p])
+            # Recognize face orthogonal to registered officer
+            m.recognizer.feature.return_value = np.array([0.0, 1.0] + [0.0] * 510, dtype=np.float32)
+            self.exercise(m, [10, 15])
+            self.assertEqual(m.latest["outcome"], "face_mismatch")
+            self.assertLess(m.latest["similarity"], 0.60)
+
+    def test_transient_ble_drop_does_not_purge_accumulated_face_samples(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = dict(
+                id="person",
+                name="Officer",
+                personnel_id="P01",
+                ble_tag="tag",
+                reference=[1.0] + [0.0] * 511,
+            )
+            m = self.make_monitor(d, [p])
+            # Sample 1 with tag present
+            self.exercise(m, [10])
+            # Transient drop: candidate list is empty
+            m.tag_list = Mock(return_value=[])
+            self.exercise(m, [10.2])
+            # Tag returns; samples 2 and 3 arrive
+            m.tag_list = Mock(return_value=[p])
+            self.exercise(m, [10.4, 10.6])
+            self.assertEqual(m.latest["outcome"], "verified")
 
     def test_face_only_never_grants(self):
         with tempfile.TemporaryDirectory() as d:
@@ -150,6 +201,28 @@ class VerificationDecisionTests(unittest.TestCase):
             self.exercise(m, [13])
             self.assertEqual(m.latest["outcome"], "ambiguous")
 
+    def test_distant_bystander_does_not_block_active_entrant(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = dict(
+                id="person",
+                name="Officer",
+                personnel_id="P01",
+                ble_tag="tag",
+                reference=[1.0] + [0.0] * 511,
+            )
+            m = self.make_monitor(d, [p])
+            active_face = np.zeros(15, np.float32)
+            active_face[:4] = [80, 40, 150, 150]
+            active_face[14] = 0.99
+            bystander_face = np.zeros(15, np.float32)
+            bystander_face[:4] = [10, 60, 65, 65]
+            bystander_face[14] = 0.99
+            m.detector.detect.return_value = (None, np.array([active_face, bystander_face]))
+            m.pipeline.associate.return_value = {0: 1, 1: 2}
+            m.pipeline.last_seen = {1: 10, 2: 10}
+            self.exercise(m, [10, 10.2, 12.5])
+            self.assertEqual(m.latest["outcome"], "verified")
+
     def test_distant_face_stays_in_approaching_state_without_premature_timeout(self):
         with tempfile.TemporaryDirectory() as d:
             m = self.make_monitor(d, [])
@@ -164,7 +237,7 @@ class VerificationDecisionTests(unittest.TestCase):
 
     def test_lateral_bystander_is_ignored_by_velocity_gate(self):
         from collections import deque
-        from revision.worker import evaluate_hybrid_gate
+        from services.recognition.worker import evaluate_hybrid_gate
 
         trajectory = deque(maxlen=16)
         settings = {"min_size": 100.0}
@@ -179,7 +252,7 @@ class VerificationDecisionTests(unittest.TestCase):
 
 class PreviewTests(unittest.TestCase):
     def test_buffer_keeps_latest_frame_instead_of_a_queue(self):
-        from revision.worker import FrameBuffer
+        from services.recognition.worker import FrameBuffer
 
         buffer = FrameBuffer()
         buffer.start()
@@ -196,7 +269,7 @@ class PreviewTests(unittest.TestCase):
         import time
         from unittest.mock import patch
 
-        from revision.worker import Monitor
+        from services.recognition.worker import Monitor
 
         started = threading.Event()
         release = threading.Event()
@@ -217,8 +290,8 @@ class PreviewTests(unittest.TestCase):
 
         with (
             tempfile.TemporaryDirectory() as d,
-            patch("revision.worker.BLEScanner"),
-            patch("revision.worker.cv2.VideoCapture", return_value=Camera()),
+            patch("services.recognition.worker.BLEScanner"),
+            patch("services.recognition.worker.cv2.VideoCapture", return_value=Camera()),
         ):
             m = Monitor(Path(d), "test-token")
             m.sync = Mock()
@@ -256,7 +329,7 @@ class PreviewTests(unittest.TestCase):
     def test_stop_wakes_waiting_preview_consumer(self):
         import threading
 
-        from revision.worker import FrameBuffer
+        from services.recognition.worker import FrameBuffer
 
         buffer = FrameBuffer()
         buffer.start()
@@ -277,26 +350,7 @@ class PreviewTests(unittest.TestCase):
         self.assertFalse(result[0][2])
 
 
-class LegacyEnrollmentTests(unittest.TestCase):
-    def test_quality_and_pose_functions_are_identical_to_legacy(self):
-        import ast
-        import inspect
-
-        from revision import enrollment_core
-
-        legacy = ast.parse((Path(__file__).resolve().parents[1] / "app.py").read_text())
-        for node in legacy.body:
-            if isinstance(node, ast.FunctionDef) and node.name in {
-                "sharpness_score",
-                "face_quality",
-                "pose_ratios",
-                "pose_matches",
-            }:
-                copied = ast.parse(
-                    inspect.getsource(getattr(enrollment_core, node.name))
-                ).body[0]
-                self.assertEqual(ast.dump(node), ast.dump(copied), node.name)
-
+class EnrollmentTests(unittest.TestCase):
     def test_enrollment_uses_all_front_references_and_normalizes_embedding(self):
         frame = np.random.default_rng(10).integers(
             50, 230, (300, 300, 3), dtype=np.uint8
@@ -329,8 +383,8 @@ class LegacyEnrollmentTests(unittest.TestCase):
             enrollment_result(frame, [face], recognizer, job)
 
     def test_weak_beacons_are_visible_for_enrollment_but_cannot_grant_access(self):
-        from ble_scanner import BLEScanner, ScanEntry, verify_tag
-        from revision.worker import Monitor
+        from services.recognition.ble_scanner import BLEScanner, ScanEntry, verify_tag
+        from services.recognition.worker import Monitor
 
         m = Monitor.__new__(Monitor)
         m.scanner = BLEScanner()
@@ -341,7 +395,7 @@ class LegacyEnrollmentTests(unittest.TestCase):
         self.assertFalse(verify_tag("test-tag", m.scanner.latest_results))
 
     def test_scan_button_sends_command_to_existing_bluetooth_owner(self):
-        from ble_scanner import BLEScanner
+        from services.recognition.ble_scanner import BLEScanner
 
         s = BLEScanner()
         s.enabled = True
@@ -355,7 +409,7 @@ class LegacyEnrollmentTests(unittest.TestCase):
 
 class CameraLifetimeTests(unittest.TestCase):
     def test_multiple_tabs_and_reconnect_grace(self):
-        from revision.worker import MonitorViewers
+        from services.recognition.worker import MonitorViewers
 
         viewers = MonitorViewers()
         viewers.start(now=10)
@@ -379,7 +433,7 @@ class CameraLifetimeTests(unittest.TestCase):
         import time
         from unittest.mock import patch
 
-        from revision.worker import Monitor
+        from services.recognition.worker import Monitor
 
         first_frame = threading.Event()
 
@@ -403,8 +457,8 @@ class CameraLifetimeTests(unittest.TestCase):
 
         with (
             tempfile.TemporaryDirectory() as d,
-            patch("revision.worker.BLEScanner"),
-            patch("revision.worker.cv2.VideoCapture", return_value=Camera()),
+            patch("services.recognition.worker.BLEScanner"),
+            patch("services.recognition.worker.cv2.VideoCapture", return_value=Camera()),
         ):
             m = Monitor(Path(d), "test-token")
             m.start_camera()
@@ -429,7 +483,7 @@ class CameraLifetimeTests(unittest.TestCase):
         from http.server import ThreadingHTTPServer
         from unittest.mock import patch
 
-        from revision.worker import Handler, Monitor
+        from services.recognition.worker import Handler, Monitor
 
         released = threading.Event()
         opening = threading.Event()
@@ -464,8 +518,8 @@ class CameraLifetimeTests(unittest.TestCase):
 
         with (
             tempfile.TemporaryDirectory() as d,
-            patch("revision.worker.BLEScanner"),
-            patch("revision.worker.cv2.VideoCapture", side_effect=open_camera),
+            patch("services.recognition.worker.BLEScanner"),
+            patch("services.recognition.worker.cv2.VideoCapture", side_effect=open_camera),
         ):
             m = Monitor(Path(d), "test-token")
             m.scanner.enabled = False
@@ -576,7 +630,7 @@ class PhotoEvidenceTests(unittest.TestCase):
         import base64
         import json
 
-        from revision.photos import jpeg
+        from services.recognition.photos import jpeg
 
         with tempfile.TemporaryDirectory() as d:
             registered = jpeg(np.full((140, 140, 3), 180, np.uint8))
@@ -620,7 +674,7 @@ class CameraRestartTests(unittest.TestCase):
         import time
         from unittest.mock import patch
 
-        from revision.worker import Monitor
+        from services.recognition.worker import Monitor
 
         reading = threading.Event()
         finish_read = threading.Event()
@@ -652,8 +706,8 @@ class CameraRestartTests(unittest.TestCase):
 
         with (
             tempfile.TemporaryDirectory() as d,
-            patch("revision.worker.BLEScanner"),
-            patch("revision.worker.cv2.VideoCapture", side_effect=Camera),
+            patch("services.recognition.worker.BLEScanner"),
+            patch("services.recognition.worker.cv2.VideoCapture", side_effect=Camera),
         ):
             m = Monitor(Path(d), "test-token")
             m.viewers.attach()
@@ -686,7 +740,7 @@ class CameraRestartTests(unittest.TestCase):
     def test_model_initialization_is_atomic_and_retries_failed_load(self):
         from unittest.mock import patch
 
-        from revision.worker import Monitor
+        from services.recognition.worker import Monitor
 
         m = Monitor.__new__(Monitor)
         m.detector = m.recognizer = None
@@ -696,9 +750,9 @@ class CameraRestartTests(unittest.TestCase):
         m.pipeline = Mock()
         detector, recognizer = Mock(), Mock()
         with (
-            patch("revision.worker.RetinaFace", return_value=detector),
+            patch("services.recognition.worker.RetinaFace", return_value=detector),
             patch(
-                "revision.worker.ArcFace",
+                "services.recognition.worker.ArcFace",
                 side_effect=[RuntimeError("model failed"), recognizer],
             ),
         ):

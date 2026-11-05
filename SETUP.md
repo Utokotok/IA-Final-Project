@@ -1,6 +1,6 @@
 # PNP same-network prototype
 
-The revision runs alongside the preserved Flask application. It uses React, Django, local PostgreSQL, and a native Python recognition service. No external account or hosting subscription is required.
+PNP Access Control uses React, Django, local PostgreSQL, and a native Python recognition service. No external account or hosting subscription is required.
 
 ## First use
 
@@ -32,7 +32,7 @@ Prerequisites: native ARM64 Python compatible with dependencies, Node.js 22+ or 
 ```sh
 brew install postgresql@17 caddy mkcert
 python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements-revision.txt
+.venv/bin/python -m pip install -r requirements.txt
 cd frontend
 pnpm install --frozen-lockfile
 pnpm run build
@@ -42,7 +42,7 @@ cd ..
 
 Setup creates a project-specific PostgreSQL cluster at `runtime/postgres`, listening only at `127.0.0.1:55432`. It does not use the Homebrew default cluster. It generates random secrets and an initial admin account. Running setup again preserves existing credentials and database records and refreshes LAN names/certificates.
 
-The frontend and runtime use no required CDN assets. Download the model weights with the existing `download_models.py` utility before an offline demonstration.
+The frontend and runtime use no required CDN assets. Download the model weights with the existing `scripts/download_models.py` utility before an offline demonstration.
 
 ## Start and stop
 
@@ -80,7 +80,7 @@ Old sightings retain their own `legacy_sighting` type and are excluded from curr
 - Resuming a draft retains accepted samples. Retaking Front resets all samples because it changes baseline pose and identity evidence.
 - BLE scanning always occurs near the MacBook. Enter the identifier flashed on the ESP32 or choose a discovered tag. Wi-Fi proximity does not imply Bluetooth proximity.
 - A single native service schedules both enrollment inference and monitoring. Processing does not occur inside web request workers. Enrollment jobs persist across service restarts.
-- The MacBook camera has one owner. Use another device for simultaneous enrollment; do not open the legacy Flask webcam view and the new monitor on the same camera at once.
+- The host camera has one owner. Use another device on the LAN for simultaneous enrollment so the host monitor does not compete for webcam access.
 - Final attempt decisions require fresh gallery information and both assigned BLE evidence and matching face evidence. Multiple faces/tags produce ambiguity rather than selecting the strongest radio signal.
 - Direction is an operator-selected prototype mode. Approval is not proof of physical entry/exit. Occupancy and relay-control status are not fabricated.
 - The old calibration implementation and saved settings remain intact. The new worker reads reviewed `data/recognition_settings.json` values at startup; the original calibration UI remains in the legacy app. Stop the new camera before using legacy camera/calibration workflows, and restart the new worker after changing reviewed settings.
@@ -119,7 +119,7 @@ Restore into a separate freshly configured installation for verification, with a
 
 ```sh
 PNP_TEST_SQLITE=1 .venv/bin/python backend/manage.py test access
-.venv/bin/python -m unittest revision.test_worker -v
+.venv/bin/python -m unittest tests.test_worker -v
 BLE_DISABLED=1 .venv/bin/python -m unittest discover -s tests -v
 cd frontend && pnpm run build
 ```
@@ -141,7 +141,7 @@ The monitor uses a continuous authenticated local MJPEG stream. A dedicated capt
 ### If registration cannot scan or capture
 
 - **Scan for Beacon** now requests a fresh scan from the MacBook and waits for its result. It works with the monitor camera off. A remote admin still scans beacons near the MacBook, using that MacBook's Bluetooth receiver.
-- Install the full dependencies with `.venv/bin/python -m pip install -r requirements-revision.txt`; `bleak` and its macOS dependencies are required. Startup checks for missing dependencies.
+- Install the full dependencies with `.venv/bin/python -m pip install -r requirements.txt`; `bleak` and its macOS dependencies are required. Startup checks for missing dependencies.
 - If a scan reports a permission error, enable Bluetooth and allow the app running Python (VS Code or Terminal) under **System Settings → Privacy & Security → Bluetooth**. The scanner displays the actual error instead of silently showing no beacons.
 - Weak beacons remain visible for enrollment, like the original version. Live access verification still enforces the existing RSSI limit.
 - On the same Mac, registration and monitoring share one physical webcam. Registration on `localhost` pauses the monitor camera before opening the browser webcam. Start the monitor camera again afterward.

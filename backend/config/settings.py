@@ -101,6 +101,7 @@ STATIC_ROOT = RUNTIME / "static"
 STATICFILES_DIRS = (
     [ROOT / "frontend" / "dist"] if (ROOT / "frontend" / "dist").exists() else []
 )
+WHITENOISE_USE_FINDERS = True
 REST_FRAMEWORK = {
     "EXCEPTION_HANDLER": "access.exceptions.handle",
     "DEFAULT_AUTHENTICATION_CLASSES": [
