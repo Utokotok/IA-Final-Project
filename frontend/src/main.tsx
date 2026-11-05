@@ -51,6 +51,20 @@ const names: any = {
   incomplete: "Incomplete",
   inactive_person: "Inactive",
 };
+
+function formatBleTag(tag: string | null | undefined): string {
+  if (!tag) return "";
+  const clean = tag.replace(/[<>]/g, "").trim();
+  const sigMatch = clean.match(/^0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb$/i);
+  if (sigMatch) {
+    return `beacon:0x${sigMatch[1].toUpperCase()}`;
+  }
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clean)) {
+    return `beacon:${clean.slice(0, 8)}`;
+  }
+  return clean;
+}
+
 const iconDimensions: Record<string, number[]> = {
   ec7e2: [17.0, 17.0],
   "70e56": [15.0, 15.0],
@@ -660,7 +674,7 @@ function Latest({ event: e }: any) {
         <Badge value={e.outcome} />
         <div className="evidence">
           <small>Assigned BLE beacon</small>
-          <b>{e.ble_tag || "Not available"}</b>
+          <b>{formatBleTag(e.ble_tag) || "Not available"}</b>
         </div>
         <p>
           Face match score{" "}
@@ -871,7 +885,7 @@ function People({ go, onSelect, fail }: any) {
                   <td className="mono">{p.personnel_id}</td>
                   <td>{p.rank || "—"}</td>
                   <td>{p.unit || "—"}</td>
-                  <td className="mono">{p.ble_tag || "—"}</td>
+                  <td className="mono">{formatBleTag(p.ble_tag) || "—"}</td>
                   <td>{new Date(p.created_at).toLocaleDateString("en-PH")}</td>
                   <td>
                     <Badge value={p.status} />
@@ -1282,7 +1296,7 @@ function LogHistory({ id, go }: any) {
             <div className="ble-identifier">
               <div>
                 <small>DETECTED IDENTIFIER</small>
-                <b>{tag?.tag || e.ble_tag || "Not recorded"}</b>
+                <b>{formatBleTag(tag?.tag || e.ble_tag) || "Not recorded"}</b>
               </div>
               <span className={"badge " + (bleValid ? "green" : "neutral")}>
                 {bleValid === null
@@ -1561,7 +1575,7 @@ function Logs({ fail, go }: any) {
                     <b>{e.name}</b>
                   </td>
                   <td>{e.rank || "—"}</td>
-                  <td className="mono">{e.ble_tag || "—"}</td>
+                  <td className="mono">{formatBleTag(e.ble_tag) || "—"}</td>
                   <td>
                     {new Date(e.timestamp).toLocaleString("en-PH", {
                       timeZone: "Asia/Manila",
@@ -2152,7 +2166,7 @@ function Registration({ initial, done, fail }: any) {
                       <Icon file="257a6" size={17} />
                     </span>
                     <div>
-                      <b>{t.tag}</b>
+                      <b>{formatBleTag(t.tag)}</b>
                       <small>Detected just now</small>
                     </div>
                     <div className="signal-bars" aria-hidden="true">
@@ -2200,7 +2214,7 @@ function Registration({ initial, done, fail }: any) {
                 <div className="notice info assigned-beacon">
                   <Icon file="257a6" size={17} />
                   <span>
-                    Assigned beacon: <b>{form.ble_tag}</b>
+                    Assigned beacon: <b>{formatBleTag(form.ble_tag)}</b>
                   </span>
                 </div>
               )}
@@ -2384,7 +2398,7 @@ function Registration({ initial, done, fail }: any) {
                 </div>
                 <hr />
                 <span className="eyebrow">ASSIGNED BLE BEACON</span>
-                <h3>{form.ble_tag}</h3>
+                <h3>{formatBleTag(form.ble_tag)}</h3>
                 <small>Assignment uniqueness checked when saved.</small>
                 <hr />
                 <span className="eyebrow">CAPTURED FACE ANGLES</span>
@@ -2748,7 +2762,13 @@ function Monitor({ user, go, logout }: any) {
             <div className="feed-bottom">
               <span>
                 BLE:{" "}
-                {state?.tags?.map((t) => t.tag).join(", ") || "No nearby tags"}
+                {state?.candidates && state.candidates.length > 0
+                  ? `Assigned: ${state.candidates[0].name} (${formatBleTag(state.candidates[0].ble_tag)})`
+                  : state?.tags && state.tags.length > 0
+                    ? state.tags.length === 1
+                      ? formatBleTag(state.tags[0].tag)
+                      : `${state.tags.length} nearby (${formatBleTag(state.tags[0].tag)}, …)`
+                    : "Waiting for beacon"}
               </span>
               <span>{state?.direction || "entry"} mode</span>
             </div>
@@ -2789,15 +2809,29 @@ function Monitor({ user, go, logout }: any) {
                 </div>
               </div>
               <div className="check-row">
-                <span className={state?.tags?.length ? "" : "pending"}>
-                  {state?.tags?.length ? "✓" : "2"}
+                <span
+                  className={
+                    event?.outcome === "verified" ||
+                    (state?.candidates && state.candidates.length > 0)
+                      ? ""
+                      : "pending"
+                  }
+                >
+                  {event?.outcome === "verified" ||
+                  (state?.candidates && state.candidates.length > 0)
+                    ? "✓"
+                    : "2"}
                 </span>
                 <div>
                   <b>BLE proximity credential</b>
                   <small className="tabular-nums">
-                    {state?.tags
-                      ?.map((t: any) => `${t.tag} · ${t.rssi} dBm`)
-                      .join(", ") || "Waiting for an assigned tag"}
+                    {event?.outcome === "verified"
+                      ? `Assigned beacon verified · ${formatBleTag(event.ble_tag) || "Credential confirmed"}`
+                      : state?.candidates && state.candidates.length > 0
+                        ? `Assigned beacon detected · ${state.candidates[0].name} (${formatBleTag(state.candidates[0].ble_tag)})`
+                        : state?.tags && state.tags.length > 0
+                          ? `Unassigned beacon detected (${formatBleTag(state.tags[0].tag)} · ${state.tags[0].rssi} dBm) · Awaiting assigned credential`
+                          : "Waiting for an assigned tag"}
                   </small>
                 </div>
               </div>
@@ -2836,7 +2870,7 @@ function Monitor({ user, go, logout }: any) {
                   </div>
                   <div>
                     <dt>BLE BEACON ID</dt>
-                    <dd>{event.ble_tag || "—"}</dd>
+                    <dd>{formatBleTag(event.ble_tag) || "—"}</dd>
                   </div>
                   <div>
                     <dt>MATCH SCORE</dt>
