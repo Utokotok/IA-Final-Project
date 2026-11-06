@@ -288,6 +288,95 @@ class VerificationDecisionTests(unittest.TestCase):
             self.assertTrue(m.overlays[0]["confirmed"])
             self.assertEqual(m.overlays[0]["label"], "Officer")
 
+    def test_multi_person_walk_in_verifies_both_officers_independently(self):
+        with tempfile.TemporaryDirectory() as d:
+            vec_a = [1.0] + [0.0] * 511
+            vec_b = [0.0, 1.0] + [0.0] * 510
+            officer_a = dict(
+                id="officer-a",
+                name="Officer Alpha",
+                personnel_id="P01",
+                ble_tag="tag-a",
+                reference=vec_a,
+            )
+            officer_b = dict(
+                id="officer-b",
+                name="Officer Bravo",
+                personnel_id="P02",
+                ble_tag="tag-b",
+                reference=vec_b,
+            )
+            m = self.make_monitor(d, [officer_a, officer_b])
+            m.gallery = [officer_a, officer_b]
+            face_a = np.zeros(15, np.float32)
+            face_a[:4] = [30, 40, 140, 140]
+            face_a[14] = 0.99
+            face_b = np.zeros(15, np.float32)
+            face_b[:4] = [160, 40, 135, 135]
+            face_b[14] = 0.99
+            m.detector.detect.return_value = (None, np.array([face_a, face_b]))
+            m.pipeline.associate.return_value = {0: 1, 1: 2}
+            m.pipeline.last_seen = {1: 10, 2: 10}
+            m.first = {1: 10, 2: 10}
+            m.recognizer.alignCrop.side_effect = lambda frame, f: "A" if f[0] == 30 else "B"
+            m.recognizer.feature.side_effect = lambda crop: np.array(
+                vec_a if crop == "A" else vec_b, dtype=np.float32
+            )
+            self.exercise(m, [10.0, 10.2, 10.4])
+            self.assertEqual(m.outbox.count(), 2)
+            self.assertEqual(len(m.overlays), 2)
+            self.assertTrue(all(o["confirmed"] for o in m.overlays))
+            self.assertEqual(
+                {o["label"] for o in m.overlays},
+                {"Officer Alpha", "Officer Bravo"},
+            )
+
+    def test_known_officer_without_ble_tag_logs_identity_on_missing_ble(self):
+        with tempfile.TemporaryDirectory() as d:
+            officer = dict(
+                id="officer-a",
+                name="Officer Alpha",
+                personnel_id="P01",
+                rank="CPT",
+                unit="HQ",
+                ble_tag="tag-a",
+                reference=[1.0] + [0.0] * 511,
+            )
+            m = self.make_monitor(d, [])
+            m.gallery = [officer]
+            self.exercise(m, [10.0, 10.2, 10.4])
+            # Face is confirmed before 4s timeout, waiting on BLE tag
+            self.assertIsNone(m.latest)
+            self.assertEqual(
+                m.overlays[0]["label"],
+                "Officer Alpha · Waiting for assigned BLE tag",
+            )
+            # At 14.5s (>4s), logs missing_ble with known officer's identity
+            self.exercise(m, [14.5])
+            self.assertEqual(m.latest["outcome"], "missing_ble")
+            self.assertEqual(m.latest["person_id"], "officer-a")
+            self.assertEqual(m.latest["name"], "Officer Alpha")
+            self.assertEqual(m.latest["personnel_id"], "P01")
+            self.assertFalse(m.latest["evidence"]["ble_verified"])
+            self.assertTrue(m.latest["evidence"]["face_confirmed"])
+
+    def test_cooldown_and_logged_track_freeze_skip_redundant_arcface_calls(self):
+        with tempfile.TemporaryDirectory() as d:
+            officer = dict(
+                id="officer-a",
+                name="Officer Alpha",
+                personnel_id="P01",
+                ble_tag="tag-a",
+                reference=[1.0] + [0.0] * 511,
+            )
+            m = self.make_monitor(d, [officer])
+            # t=10.05 and 10.10 are within the 0.15s cooldown; t=11.0 and 14.0 are after verification
+            self.exercise(m, [10.0, 10.05, 10.10, 10.2, 10.4, 11.0, 14.0])
+            self.assertEqual(m.recognizer.feature.call_count, 3)
+            self.assertEqual(m.latest["outcome"], "verified")
+            self.assertTrue(m.overlays[0]["confirmed"])
+            self.assertEqual(m.overlays[0]["label"], "Officer Alpha")
+
 
 class PreviewTests(unittest.TestCase):
     def test_buffer_keeps_latest_frame_instead_of_a_queue(self):

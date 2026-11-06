@@ -112,8 +112,9 @@ def decision(samples, people, settings, now, gallery=None):
     runner_up = float(np.partition(scores, -2)[-2]) if len(scores) > 1 else -1.
 
     if gallery:
+        scored_ids = {p['id'] for p in people}
         for other in gallery:
-            if other['id'] == best_id:
+            if other['id'] in scored_ids:
                 continue
             other_score, _ = _score_person(vectors, mean_unit, other, weights=weights)
             if other_score > runner_up:
