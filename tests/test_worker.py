@@ -436,6 +436,126 @@ class VerificationDecisionTests(unittest.TestCase):
             self.assertEqual(rows[1]["snapshot"], {})
             self.assertFalse(rows[1]["evidence"]["ble_verified"])
 
+    def test_resolve_overlay_stage_never_shows_verifying_on_denied_outcomes(self):
+        from services.recognition.worker import resolve_overlay_stage
+
+        gate = dict(
+            triggered=True,
+            kinematics_ready=True,
+            is_lateral_passerby=False,
+            distance_m=1.1,
+        )
+        candidate_a = dict(id="officer-a", name="Officer Alpha")
+        officer_b = dict(id="officer-b", name="Officer Bravo")
+
+        for outcome in (
+            "ambiguous",
+            "face_mismatch",
+            "timeout",
+            "missing_ble",
+            "unknown_tag",
+            "service_unavailable",
+        ):
+            stage, label = resolve_overlay_stage(
+                outcome, officer_b, True, gate, None, [candidate_a]
+            )
+            self.assertEqual(stage, "denied")
+            self.assertNotIn("Verifying", label)
+
+        stage, label = resolve_overlay_stage(
+            None, officer_b, True, gate, None, [candidate_a]
+        )
+        self.assertEqual(stage, "evaluating")
+        self.assertEqual(label, "Officer Bravo · Waiting for assigned BLE tag")
+
+    def test_multi_person_track_recovers_after_initial_missing_ble_or_ambiguous_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            vec_b = [0.0, 1.0] + [0.0] * 510
+            officer_b = dict(
+                id="officer-b",
+                name="Officer Bravo",
+                personnel_id="P02",
+                ble_tag="tag-b",
+                reference=vec_b,
+            )
+            m = self.make_monitor(d, [])
+            m.gallery = [officer_b]
+            m.recognizer.feature.return_value = np.array(vec_b, dtype=np.float32)
+
+            # Collect 3 samples without BLE tag, then cross the 4s timeout -> missing_ble
+            self.exercise(m, [10.0, 10.2, 10.4, 14.5])
+            self.assertEqual(m.latest["outcome"], "missing_ble")
+            self.assertEqual(m.overlays[0]["stage"], "denied")
+            self.assertEqual(
+                m.overlays[0]["label"],
+                "Officer Bravo · Waiting for assigned BLE tag",
+            )
+            self.assertEqual(m.outbox.count(), 1)
+
+            # BLE tag arrives for the same track -> track must recover and verify
+            m.tag_list = Mock(return_value=[officer_b])
+            self.exercise(m, [15.0])
+            self.assertEqual(m.latest["outcome"], "verified")
+            self.assertEqual(m.latest["person_id"], "officer-b")
+            self.assertTrue(m.overlays[0]["confirmed"])
+            self.assertEqual(m.overlays[0]["stage"], "verified")
+            self.assertEqual(m.overlays[0]["label"], "Officer Bravo")
+            self.assertEqual(m.outbox.count(), 2)
+
+    def test_departed_verified_person_ble_tag_does_not_leak_to_remaining_person(self):
+        with tempfile.TemporaryDirectory() as d:
+            vec_a = [1.0] + [0.0] * 511
+            vec_b = [0.0, 1.0] + [0.0] * 510
+            officer_a = dict(
+                id="officer-a",
+                name="Officer Alpha",
+                personnel_id="P01",
+                ble_tag="tag-a",
+                reference=vec_a,
+            )
+            officer_b = dict(
+                id="officer-b",
+                name="Officer Bravo",
+                personnel_id="P02",
+                ble_tag="tag-b",
+                reference=vec_b,
+            )
+            m = self.make_monitor(d, [officer_a])
+            m.gallery = [officer_a, officer_b]
+            face_a = np.zeros(15, np.float32)
+            face_a[:4] = [30, 40, 150, 150]
+            face_a[14] = 0.99
+            face_b = np.zeros(15, np.float32)
+            face_b[:4] = [170, 40, 140, 140]
+            face_b[14] = 0.99
+            m.detector.detect.return_value = (None, np.array([face_a, face_b]))
+            m.pipeline.associate.return_value = {0: 1, 1: 2}
+            m.pipeline.last_seen = {1: 10, 2: 10}
+            m.first = {1: 10, 2: 10}
+            m.recognizer.alignCrop.side_effect = (
+                lambda frame, f: "A" if f[0] == 30 else "B"
+            )
+            m.recognizer.feature.side_effect = lambda crop: np.array(
+                vec_a if crop == "A" else vec_b, dtype=np.float32
+            )
+
+            # Both officers are seen on frames 1..3; Officer Alpha verifies using tag-a
+            self.exercise(m, [10.0, 10.2, 10.4])
+            self.assertEqual(m.latest["outcome"], "verified")
+            self.assertEqual(m.latest["person_id"], "officer-a")
+
+            # Officer Alpha walks out of camera view at t=11.0, while tag-a lingers in BLE range
+            m.detector.detect.return_value = (None, np.array([face_b]))
+            m.pipeline.associate.return_value = {0: 2}
+            m.pipeline.last_seen = {2: 11.0}
+            self.exercise(m, [11.0])
+            self.assertEqual(len(m.overlays), 1)
+            self.assertEqual(m.overlays[0]["stage"], "evaluating")
+            self.assertEqual(
+                m.overlays[0]["label"],
+                "Officer Bravo · Waiting for assigned BLE tag",
+            )
+
 
 class PreviewTests(unittest.TestCase):
     def test_buffer_keeps_latest_frame_instead_of_a_queue(self):

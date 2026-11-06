@@ -45,6 +45,16 @@ TRACK_CONFIRMATION_TTL = 2.5
 SAMPLE_COOLDOWN_S = 0.15
 CONFIRMED_REFRESH_S = 1.0
 MAX_ARCFACE_PER_FRAME = 2
+TRIGGER_HYSTERESIS_S = 0.75
+BLE_CLAIM_RETENTION_S = 5.0
+DENIED_OUTCOME_LABELS = {
+    "missing_ble": "Waiting for assigned BLE tag",
+    "unknown_tag": "Unknown BLE tag",
+    "ambiguous": "Ambiguous · Multiple people in zone",
+    "face_mismatch": "Face mismatch",
+    "timeout": "Verification timed out",
+    "service_unavailable": "Service unavailable",
+}
 
 
 def _prepare_gallery(people):
@@ -352,16 +362,25 @@ def evaluate_verification_outcome(
 
 def resolve_overlay_stage(outcome, person, is_triggered, gate, warning, candidates):
     """Determine UI stage and human-readable status label for a tracked face."""
-    default_prompt = "Verifying" if candidates else "Waiting for assigned BLE tag"
+    candidate_ids = {p["id"] for p in candidates}
+    has_matching_candidate = (
+        (person["id"] in candidate_ids) if person else bool(candidates)
+    )
+    default_prompt = (
+        "Verifying" if has_matching_candidate else "Waiting for assigned BLE tag"
+    )
     if outcome == "verified" and person:
         return "verified", person["name"]
     if outcome:
         if person and outcome in ("missing_ble", "unknown_tag"):
-            return "denied", f"{person['name']} · {default_prompt}"
-        return "denied", warning or default_prompt
+            return "denied", f"{person['name']} · Waiting for assigned BLE tag"
+        reason = warning or DENIED_OUTCOME_LABELS.get(outcome, "Access denied")
+        if person and outcome not in ("face_mismatch", "ambiguous"):
+            return "denied", f"{person['name']} · {reason}"
+        return "denied", reason
     if is_triggered:
-        if person and not candidates:
-            return "evaluating", f"{person['name']} · {default_prompt}"
+        if person and not has_matching_candidate:
+            return "evaluating", f"{person['name']} · Waiting for assigned BLE tag"
         return "evaluating", warning or default_prompt
     if not gate["kinematics_ready"]:
         label = (
@@ -417,9 +436,11 @@ class Monitor:
         self.samples = defaultdict(lambda: deque(maxlen=24))
         self.trajectories = defaultdict(lambda: deque(maxlen=16))
         self.first = {}
+        self.last_triggered = {}
         self.logged = set()
         self.logged_outcomes = {}
         self.confirmed_tracks = set()
+        self.verified_claims = {}
         self.session = uuid.uuid4().hex
         self.settings = self.pipeline.settings
         self.load_cache()
@@ -580,9 +601,11 @@ class Monitor:
             self.trajectories.clear()
             self.best_captures.clear()
             self.first.clear()
+            self.last_triggered.clear()
             self.logged.clear()
             self.logged_outcomes.clear()
             self.confirmed_tracks.clear()
+            self.verified_claims.clear()
             self.pipeline.reset()
         self.cache_photos(data["people"])
         self.last_gallery = time.monotonic()
@@ -608,9 +631,11 @@ class Monitor:
             self.trajectories.clear()
             self.best_captures.clear()
             self.first.clear()
+            self.last_triggered.clear()
             self.logged.clear()
             self.logged_outcomes.clear()
             self.confirmed_tracks.clear()
+            self.verified_claims.clear()
             self.pipeline.reset()
         self.direction = new_direction
         self.outbox.flush(self.api)
@@ -662,9 +687,12 @@ class Monitor:
         logged_outcomes = getattr(self, "logged_outcomes", None)
         confirmed_tracks = getattr(self, "confirmed_tracks", None)
         track_telemetry = getattr(self, "track_telemetry", None)
+        last_triggered = getattr(self, "last_triggered", None)
         for track in list(self.first) + list(trajectories):
             if track not in self.pipeline.last_seen:
                 self.first.pop(track, None)
+                if last_triggered is not None:
+                    last_triggered.pop(track, None)
                 self.samples.pop(track, None)
                 trajectories.pop(track, None)
                 self.best_captures.pop(track, None)
@@ -825,6 +853,12 @@ class Monitor:
         confirmed_tracks = getattr(self, "confirmed_tracks", None)
         if confirmed_tracks is None:
             confirmed_tracks = self.confirmed_tracks = set()
+        verified_claims = getattr(self, "verified_claims", None)
+        if verified_claims is None:
+            verified_claims = self.verified_claims = {}
+        last_triggered = getattr(self, "last_triggered", None)
+        if last_triggered is None:
+            last_triggered = self.last_triggered = {}
         track_telemetry = getattr(self, "track_telemetry", None)
         if track_telemetry is None:
             track_telemetry = self.track_telemetry = defaultdict(
@@ -844,8 +878,13 @@ class Monitor:
             )
             if gate["triggered"]:
                 self.first.setdefault(track, now)
-            else:
+                last_triggered[track] = now
+            elif (
+                not gate["kinematics_ready"]
+                or now - last_triggered.get(track, -1e9) > TRIGGER_HYSTERESIS_S
+            ):
                 self.first.pop(track, None)
+                last_triggered.pop(track, None)
             quality = quality_metrics(frame, face)
             warning = rejection(quality, self.settings)
             tracked_items.append((index, track, face, gate, quality, warning))
@@ -859,7 +898,10 @@ class Monitor:
         for i, (_, track, _, gate, _, warning) in enumerate(tracked_items):
             if warning is not None or not gate["kinematics_ready"]:
                 continue
-            if track in self.logged:
+            if (
+                track in self.logged
+                and logged_outcomes.get(track, (None,))[0] == "verified"
+            ):
                 continue
             history = self.samples[track]
             cooldown = (
@@ -920,17 +962,27 @@ class Monitor:
         candidate_claims = {}
         active_verified_in_frame = False
 
+        for pid, (owner_track, seen_at) in list(verified_claims.items()):
+            if now - seen_at > BLE_CLAIM_RETENTION_S:
+                verified_claims.pop(pid, None)
+            elif pid in candidate_ids:
+                candidate_claims[pid] = (2, 0, 0.99, 0.0, owner_track)
+
         for list_idx, (_, track, face, gate, quality, warning) in enumerate(tracked_items):
             if list_idx in extracted_vectors:
                 self._record_sample(
                     track, frame, face, extracted_vectors[list_idx], quality, now
                 )
-            if track in self.logged and track in logged_outcomes:
+            if (
+                track in self.logged
+                and logged_outcomes.get(track, (None,))[0] == "verified"
+            ):
                 outcome, event_person, result = logged_outcomes[track]
                 track_results[track] = result
-                if outcome == "verified" and event_person:
+                if event_person:
                     pid = event_person["id"]
-                    candidate_claims[pid] = (3, 1.0, gate["face_size"], track)
+                    verified_claims[pid] = (track, now)
+                    candidate_claims[pid] = (3, 1, 1.0, gate["face_size"], track)
                     active_verified_in_frame = True
                 continue
 
@@ -951,27 +1003,36 @@ class Monitor:
             if result["confirmed"] and t_info["face_confirmed_at"] is None:
                 t_info["face_confirmed_at"] = now
 
-            if gate["triggered"]:
-                claim_id = result.get("person_id") or result.get("candidate_id")
+            if gate["triggered"] or (
+                gate["kinematics_ready"] and result.get("confirmed")
+            ):
+                claim_id = (
+                    result.get("person_id")
+                    if result.get("confirmed")
+                    else (result.get("person_id") or result.get("candidate_id"))
+                )
                 if claim_id in candidate_ids:
                     rank = (
                         2 if result.get("confirmed") else 1,
+                        1 if gate["triggered"] else 0,
                         float(result.get("similarity") or 0.0),
                         gate["face_size"],
                         -track,
                     )
                     prev = candidate_claims.get(claim_id)
-                    if prev is None or rank[:3] > prev[:3]:
+                    if prev is None or rank[:4] > prev[:4]:
                         candidate_claims[claim_id] = (
                             rank[0],
                             rank[1],
                             rank[2],
+                            rank[3],
                             track,
                         )
             track_results[track] = result
 
         claimed_by_track = {
-            owner_track: pid for pid, (_, _, _, owner_track) in candidate_claims.items()
+            owner_track: pid
+            for pid, (_, _, _, _, owner_track) in candidate_claims.items()
         }
 
         # Pass 2: Evaluate verification outcomes with isolated unclaimed BLE candidates per track
@@ -986,7 +1047,10 @@ class Monitor:
             ]
             unclaimed_candidate_ids = {p["id"] for p in unclaimed_candidates}
 
-            if track in self.logged and track in logged_outcomes:
+            if (
+                track in self.logged
+                and logged_outcomes.get(track, (None,))[0] == "verified"
+            ):
                 outcome, event_person, result = logged_outcomes[track]
                 effective_warning = None
             else:
@@ -1016,7 +1080,11 @@ class Monitor:
                     if not any(ct and ct in v.get("tag", "").lower() for ct in claimed_tags)
                 ]
 
-                elapsed = (now - self.first[track]) if is_triggered else 0.0
+                elapsed = (
+                    (now - self.first[track])
+                    if is_triggered and track in self.first
+                    else 0.0
+                )
                 outcome = evaluate_verification_outcome(
                     is_triggered=is_triggered,
                     competing_faces=unclaimed_competing_faces,
@@ -1044,9 +1112,26 @@ class Monitor:
                 event_person = matched_person or fallback_person
                 if not self.current_processing_session():
                     return
-                if outcome and track not in self.logged:
+                prior_logged_outcome = (
+                    logged_outcomes[track][0]
+                    if track in self.logged and track in logged_outcomes
+                    else None
+                )
+                should_log = bool(
+                    outcome
+                    and (
+                        track not in self.logged
+                        or (
+                            outcome == "verified"
+                            and prior_logged_outcome != "verified"
+                        )
+                    )
+                )
+                if should_log:
                     if outcome == "verified":
                         active_verified_in_frame = True
+                        if event_person:
+                            verified_claims[event_person["id"]] = (track, now)
                     ble_verified = bool(
                         event_person and event_person["id"] in unclaimed_candidate_ids
                     )
@@ -1081,6 +1166,8 @@ class Monitor:
                             outcome != "verified" and active_verified_in_frame
                         ),
                     )
+                    logged_outcomes[track] = (outcome, event_person, result)
+                elif outcome and track in self.logged:
                     logged_outcomes[track] = (outcome, event_person, result)
 
             stage, label = resolve_overlay_stage(
