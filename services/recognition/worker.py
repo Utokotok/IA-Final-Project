@@ -329,8 +329,11 @@ def evaluate_verification_outcome(
     matched_id = result.get("person_id") if result.get("confirmed") else None
     if matched_id and matched_id in candidate_ids:
         return "verified" if fresh else ("service_unavailable" if elapsed > 4 else None)
-    if competing_faces > 1 or len(candidates) > 1:
-        return "ambiguous" if elapsed > 2 else None
+    if not matched_id and candidates:
+        if len(candidates) > 1:
+            return "ambiguous" if elapsed > 2 else None
+        if competing_faces > 1 and result.get("candidate_id") not in candidate_ids:
+            return "ambiguous" if elapsed > 4 else None
     if elapsed <= 4:
         return None
     if not fresh:
@@ -658,6 +661,7 @@ class Monitor:
     def _prune_stale_tracks(self, trajectories):
         logged_outcomes = getattr(self, "logged_outcomes", None)
         confirmed_tracks = getattr(self, "confirmed_tracks", None)
+        track_telemetry = getattr(self, "track_telemetry", None)
         for track in list(self.first) + list(trajectories):
             if track not in self.pipeline.last_seen:
                 self.first.pop(track, None)
@@ -669,6 +673,8 @@ class Monitor:
                     logged_outcomes.pop(track, None)
                 if confirmed_tracks is not None:
                     confirmed_tracks.discard(track)
+                if track_telemetry is not None:
+                    track_telemetry.pop(track, None)
 
     def _sync_candidate_signature(self, candidates):
         signature = tuple(sorted(p["id"] for p in candidates))
@@ -698,7 +704,18 @@ class Monitor:
                 )
 
     def _record_event(
-        self, track, frame, face, outcome, person, result, now, *, ble_verified=False
+        self,
+        track,
+        frame,
+        face,
+        outcome,
+        person,
+        result,
+        now,
+        *,
+        ble_verified=False,
+        telemetry=None,
+        preserve_latest=False,
     ):
         best = self.best_captures.get(track)
         if best and now - best["time"] <= 6:
@@ -710,6 +727,22 @@ class Monitor:
                 datetime.now(timezone.utc).isoformat(),
             )
         registered = self.registered_photo(person)
+        evidence = dict(
+            gallery_version=self.gallery_version,
+            model_id=MODEL_ID,
+            track_id=track,
+            session=self.session,
+            ble_tags=self.visible,
+            ble_verified=bool(ble_verified),
+            face_confirmed=bool(result.get("confirmed")),
+            profile_version=person.get("profile_version")
+            if person
+            else None,
+            settings=self.settings,
+            sample_count=result.get("sample_count", 0),
+        )
+        if telemetry:
+            evidence["telemetry"] = telemetry
         event = dict(
             id=str(uuid.uuid4()),
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -731,23 +764,12 @@ class Monitor:
             if person
             else {},
             similarity=result.get("similarity"),
-            evidence=dict(
-                gallery_version=self.gallery_version,
-                model_id=MODEL_ID,
-                track_id=track,
-                session=self.session,
-                ble_tags=self.visible,
-                ble_verified=bool(ble_verified),
-                face_confirmed=bool(result.get("confirmed")),
-                profile_version=person.get("profile_version")
-                if person
-                else None,
-                settings=self.settings,
-                sample_count=result.get("sample_count", 0),
-            ),
+            evidence=evidence,
         )
         self.outbox.add(event)
         self.logged.add(track)
+        if preserve_latest and self.latest is not None:
+            return
         with self.lock:
             self.latest_images = dict(
                 id=event["id"], captured=captured, registered=registered
@@ -770,7 +792,9 @@ class Monitor:
 
     def process(self, frame):
         self.initialize()
+        t0 = time.perf_counter()
         _, faces = self.detector.detect(frame)
+        detect_ms = round((time.perf_counter() - t0) * 1000, 1)
         faces = [] if faces is None else faces
         now = time.monotonic()
         assign = self.pipeline.associate(faces, now, (frame.shape[1], frame.shape[0]))
@@ -778,14 +802,17 @@ class Monitor:
         if not self.current_processing_session():
             return
         with self.lock:
-            self.overlays = [
-                dict(
-                    box=face[:4].astype(float).tolist(),
-                    label="Verifying" if candidates else "Waiting for assigned BLE tag",
-                    confirmed=False,
-                )
-                for face in faces
-            ]
+            if not getattr(self, "overlays", None):
+                self.overlays = [
+                    dict(
+                        box=face[:4].astype(float).tolist(),
+                        label="Verifying"
+                        if candidates
+                        else "Waiting for assigned BLE tag",
+                        confirmed=False,
+                    )
+                    for face in faces
+                ]
             self.overlay_size = [frame.shape[1], frame.shape[0]]
             self.overlay_time = time.monotonic()
 
@@ -798,6 +825,11 @@ class Monitor:
         confirmed_tracks = getattr(self, "confirmed_tracks", None)
         if confirmed_tracks is None:
             confirmed_tracks = self.confirmed_tracks = set()
+        track_telemetry = getattr(self, "track_telemetry", None)
+        if track_telemetry is None:
+            track_telemetry = self.track_telemetry = defaultdict(
+                lambda: dict(rejections={}, face_confirmed_at=None, yaws=[])
+            )
         self._prune_stale_tracks(trajectories)
         self._sync_candidate_signature(candidates)
 
@@ -850,6 +882,7 @@ class Monitor:
         )
         ready_indices = ready_indices[:MAX_ARCFACE_PER_FRAME]
 
+        t_arc = time.perf_counter()
         extracted_vectors = {}
         if len(ready_indices) > 1 and isinstance(self.recognizer, ArcFace):
             crops = [
@@ -865,6 +898,7 @@ class Monitor:
                 extracted_vectors[i] = self.recognizer.feature(
                     self.recognizer.alignCrop(frame, face)
                 ).flatten()
+        arcface_ms = round((time.perf_counter() - t_arc) * 1000, 1) if ready_indices else 0.0
 
         # Merge full gallery + active BLE candidates for 1:N identification + 1:1 BLE binding
         candidate_ids = {p["id"] for p in candidates}
@@ -880,39 +914,114 @@ class Monitor:
         people = list(merged_map.values())
         full_gallery = getattr(self, "gallery", None)
         fresh = now - self.last_gallery < 30
-        fallback_person = candidates[0] if len(candidates) == 1 else None
-        overlays = []
+
+        # Pass 1: Record samples, evaluate biometric decisions, and resolve per-track BLE claims
+        track_results = {}
+        candidate_claims = {}
+        active_verified_in_frame = False
 
         for list_idx, (_, track, face, gate, quality, warning) in enumerate(tracked_items):
-            is_triggered = gate["triggered"]
             if list_idx in extracted_vectors:
                 self._record_sample(
                     track, frame, face, extracted_vectors[list_idx], quality, now
                 )
             if track in self.logged and track in logged_outcomes:
                 outcome, event_person, result = logged_outcomes[track]
+                track_results[track] = result
+                if outcome == "verified" and event_person:
+                    pid = event_person["id"]
+                    candidate_claims[pid] = (3, 1.0, gate["face_size"], track)
+                    active_verified_in_frame = True
+                continue
+
+            history = self.samples[track]
+            result = decision(
+                history, people, self.settings, now, gallery=full_gallery
+            )
+            if history and now - history[-1]["time"] > TRACK_CONFIRMATION_TTL:
+                result["confirmed"] = False
+            if result["confirmed"]:
+                confirmed_tracks.add(track)
+            else:
+                confirmed_tracks.discard(track)
+
+            t_info = track_telemetry[track]
+            if quality and "yaw" in quality:
+                t_info["yaws"].append(abs(float(quality["yaw"])))
+            if result["confirmed"] and t_info["face_confirmed_at"] is None:
+                t_info["face_confirmed_at"] = now
+
+            if gate["triggered"]:
+                claim_id = result.get("person_id") or result.get("candidate_id")
+                if claim_id in candidate_ids:
+                    rank = (
+                        2 if result.get("confirmed") else 1,
+                        float(result.get("similarity") or 0.0),
+                        gate["face_size"],
+                        -track,
+                    )
+                    prev = candidate_claims.get(claim_id)
+                    if prev is None or rank[:3] > prev[:3]:
+                        candidate_claims[claim_id] = (
+                            rank[0],
+                            rank[1],
+                            rank[2],
+                            track,
+                        )
+            track_results[track] = result
+
+        claimed_by_track = {
+            owner_track: pid for pid, (_, _, _, owner_track) in candidate_claims.items()
+        }
+
+        # Pass 2: Evaluate verification outcomes with isolated unclaimed BLE candidates per track
+        overlays = []
+        for list_idx, (_, track, face, gate, quality, warning) in enumerate(tracked_items):
+            is_triggered = gate["triggered"]
+            claimed_by_others = {
+                pid for t, pid in claimed_by_track.items() if t != track
+            }
+            unclaimed_candidates = [
+                p for p in candidates if p["id"] not in claimed_by_others
+            ]
+            unclaimed_candidate_ids = {p["id"] for p in unclaimed_candidates}
+
+            if track in self.logged and track in logged_outcomes:
+                outcome, event_person, result = logged_outcomes[track]
                 effective_warning = None
             else:
-                history = self.samples[track]
-                result = decision(
-                    history, people, self.settings, now, gallery=full_gallery
-                )
-                if history and now - history[-1]["time"] > TRACK_CONFIRMATION_TTL:
-                    result["confirmed"] = False
-                if result["confirmed"]:
-                    confirmed_tracks.add(track)
-                else:
-                    confirmed_tracks.discard(track)
-
+                result = track_results[track]
                 effective_warning = warning or (
                     None if result["confirmed"] else pose_guidance(quality)
                 )
+                t_info = track_telemetry[track]
+                if effective_warning and is_triggered:
+                    t_info["rejections"][effective_warning] = (
+                        t_info["rejections"].get(effective_warning, 0) + 1
+                    )
+
+                unclaimed_competing_faces = sum(
+                    1
+                    for _, t, _, g, _, _ in tracked_items
+                    if g["triggered"] and (t == track or t not in claimed_by_track)
+                )
+                claimed_tags = {
+                    (merged_map[pid].get("ble_tag") or "").lower()
+                    for pid in claimed_by_others
+                    if pid in merged_map and merged_map[pid].get("ble_tag")
+                }
+                unclaimed_visible = [
+                    v
+                    for v in self.visible
+                    if not any(ct and ct in v.get("tag", "").lower() for ct in claimed_tags)
+                ]
+
                 elapsed = (now - self.first[track]) if is_triggered else 0.0
                 outcome = evaluate_verification_outcome(
                     is_triggered=is_triggered,
-                    competing_faces=competing_faces,
-                    candidates=candidates,
-                    visible_tags=self.visible,
+                    competing_faces=unclaimed_competing_faces,
+                    candidates=unclaimed_candidates,
+                    visible_tags=unclaimed_visible,
                     result=result,
                     warning=effective_warning,
                     fresh=fresh,
@@ -924,12 +1033,39 @@ class Monitor:
                     if result.get("confirmed")
                     else None
                 )
+                # Never attribute a BLE owner to an unconfirmed face when multiple faces are present or outcome is ambiguous
+                fallback_person = (
+                    unclaimed_candidates[0]
+                    if competing_faces == 1
+                    and len(unclaimed_candidates) == 1
+                    and outcome in ("timeout", "face_mismatch", "service_unavailable")
+                    else None
+                )
                 event_person = matched_person or fallback_person
                 if not self.current_processing_session():
                     return
                 if outcome and track not in self.logged:
+                    if outcome == "verified":
+                        active_verified_in_frame = True
                     ble_verified = bool(
-                        event_person and event_person["id"] in candidate_ids
+                        event_person and event_person["id"] in unclaimed_candidate_ids
+                    )
+                    telemetry_payload = dict(
+                        elapsed_ms=round(elapsed * 1000),
+                        face_confirm_ms=round(
+                            (t_info["face_confirmed_at"] - self.first.get(track, t_info["face_confirmed_at"]))
+                            * 1000
+                        )
+                        if t_info["face_confirmed_at"] is not None
+                        else None,
+                        competing_faces=competing_faces,
+                        unclaimed_competing_faces=unclaimed_competing_faces,
+                        rejection_counts=dict(t_info["rejections"]),
+                        mean_yaw=round(float(np.mean(t_info["yaws"])), 3)
+                        if t_info["yaws"]
+                        else None,
+                        detect_ms=detect_ms,
+                        arcface_ms=arcface_ms,
                     )
                     self._record_event(
                         track,
@@ -940,11 +1076,20 @@ class Monitor:
                         result,
                         now,
                         ble_verified=ble_verified,
+                        telemetry=telemetry_payload,
+                        preserve_latest=(
+                            outcome != "verified" and active_verified_in_frame
+                        ),
                     )
                     logged_outcomes[track] = (outcome, event_person, result)
 
             stage, label = resolve_overlay_stage(
-                outcome, event_person, is_triggered, gate, effective_warning, candidates
+                outcome,
+                event_person,
+                is_triggered,
+                gate,
+                effective_warning,
+                unclaimed_candidates,
             )
             overlays.append(
                 dict(
@@ -959,6 +1104,9 @@ class Monitor:
                 )
             )
 
+        overlays.sort(
+            key=lambda o: (not o["confirmed"], not o["triggered"], o["distance_m"])
+        )
         if not self.current_processing_session():
             return
         with self.lock:

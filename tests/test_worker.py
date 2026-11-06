@@ -377,6 +377,65 @@ class VerificationDecisionTests(unittest.TestCase):
             self.assertTrue(m.overlays[0]["confirmed"])
             self.assertEqual(m.overlays[0]["label"], "Officer Alpha")
 
+    def test_unregistered_companion_does_not_steal_ble_identity_or_trigger_ambiguous(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as d:
+            vec_a = [1.0] + [0.0] * 511
+            vec_unknown = [0.0, 1.0] + [0.0] * 510
+            officer_a = dict(
+                id="officer-a",
+                name="Officer Alpha",
+                personnel_id="P01",
+                ble_tag="tag-a",
+                reference=vec_a,
+            )
+            m = self.make_monitor(d, [officer_a])
+            m.gallery = [officer_a]
+            face_a = np.zeros(15, np.float32)
+            face_a[:4] = [30, 40, 150, 150]
+            face_a[14] = 0.99
+            face_companion = np.zeros(15, np.float32)
+            face_companion[:4] = [170, 50, 120, 120]
+            face_companion[14] = 0.99
+            m.detector.detect.return_value = (
+                None,
+                np.array([face_a, face_companion]),
+            )
+            m.pipeline.associate.return_value = {0: 1, 1: 2}
+            m.pipeline.last_seen = {1: 10, 2: 10}
+            m.first = {1: 10, 2: 10}
+            m.recognizer.alignCrop.side_effect = (
+                lambda frame, f: "A" if f[0] == 30 else "U"
+            )
+            m.recognizer.feature.side_effect = lambda crop: np.array(
+                vec_a if crop == "A" else vec_unknown, dtype=np.float32
+            )
+            # At 10.4s Officer Alpha verifies; at 12.5s (>2s) companion must NOT trigger ambiguous
+            self.exercise(m, [10.0, 10.2, 10.4, 12.5])
+            self.assertEqual(m.outbox.count(), 1)
+            self.assertEqual(m.latest["outcome"], "verified")
+            self.assertEqual(m.latest["name"], "Officer Alpha")
+            self.assertIn("telemetry", m.latest["evidence"])
+            # At 14.5s (>4s), companion logs missing_ble as Unidentified without overwriting Officer Alpha's verified banner
+            self.exercise(m, [14.5])
+            self.assertEqual(m.outbox.count(), 2)
+            self.assertEqual(m.latest["outcome"], "verified")
+            self.assertEqual(m.latest["name"], "Officer Alpha")
+            with m.outbox.connection() as db:
+                rows = [
+                    json.loads(r[0])
+                    for r in db.execute(
+                        "SELECT payload FROM events ORDER BY rowid"
+                    ).fetchall()
+                ]
+            self.assertEqual(rows[0]["outcome"], "verified")
+            self.assertEqual(rows[0]["person_id"], "officer-a")
+            self.assertEqual(rows[1]["outcome"], "missing_ble")
+            self.assertIsNone(rows[1]["person_id"])
+            self.assertEqual(rows[1]["snapshot"], {})
+            self.assertFalse(rows[1]["evidence"]["ble_verified"])
+
 
 class PreviewTests(unittest.TestCase):
     def test_buffer_keeps_latest_frame_instead_of_a_queue(self):
