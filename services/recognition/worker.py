@@ -19,20 +19,21 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import cv2
 import numpy as np
 
-from ble_scanner import BLEScanner, verify_tag
-from calibration import load_settings
-from face_models import MODEL_ID, ArcFace, RetinaFace
-from revision.enrollment_core import THRESHOLD, face_quality, pose_matches, pose_ratios
-from revision.photos import jpeg, validate_jpeg
-from video_pipeline import (
+from services.recognition.ble_scanner import BLEScanner, verify_tag
+from services.recognition.calibration import load_settings
+from services.recognition.face_models import MODEL_ID, ArcFace, RetinaFace
+from services.recognition.enrollment_core import THRESHOLD, face_quality, pose_matches, pose_ratios
+from services.recognition.photos import jpeg, validate_jpeg
+from services.recognition.video_pipeline import (
     DEFAULTS,
     VideoPipeline,
     decision,
+    pose_guidance,
     quality_metrics,
     quality_weight,
     rejection,
@@ -40,6 +41,7 @@ from video_pipeline import (
 
 LOG = logging.getLogger("pnp.monitor")
 POSES = ["front", "left", "right", "up", "down"]
+TRACK_CONFIRMATION_TTL = 2.5
 
 
 def enrollment_result(frame, faces, recognizer, job):
@@ -256,16 +258,21 @@ def evaluate_hybrid_gate(face, frame_shape, trajectory, settings, now):
         trajectory.popleft()
 
     lateral_velocity = 0.0
+    vertical_velocity = 0.0
     scale_velocity = 0.0
     if len(trajectory) >= 2:
         anchor = trajectory[0]
         dt = now - anchor["time"]
         if dt >= 0.08:
             lateral_velocity = abs(cx_norm - anchor["cx"]) / dt
+            vertical_velocity = (cy_norm - anchor["cy"]) / dt
             scale_velocity = (face_size - anchor["size"]) / dt
 
     in_corridor = 0.06 <= cx_norm <= 0.94
-    is_lateral_passerby = lateral_velocity > 0.45 and scale_velocity < 12.0
+    approaching_camera = scale_velocity >= 12.0 or (
+        scale_velocity >= 4.0 and vertical_velocity > 0.15
+    )
+    is_lateral_passerby = lateral_velocity > 0.45 and not approaching_camera
     is_receding = scale_velocity < -25.0
     kinematics_ready = in_corridor and not is_lateral_passerby and not is_receding
 
@@ -283,9 +290,60 @@ def evaluate_hybrid_gate(face, frame_shape, trajectory, settings, now):
         is_lateral_passerby=is_lateral_passerby,
         is_receding=is_receding,
         lateral_velocity=round(lateral_velocity, 3),
+        vertical_velocity=round(vertical_velocity, 3),
         scale_velocity=round(scale_velocity, 1),
         triggered=bool(scale_ready and kinematics_ready),
     )
+
+
+def evaluate_verification_outcome(
+    *,
+    is_triggered,
+    competing_faces,
+    candidates,
+    visible_tags,
+    result,
+    warning,
+    fresh,
+    elapsed,
+    threshold,
+):
+    """Pure state machine transition for access verification decisions."""
+    if not is_triggered:
+        return None
+    if competing_faces > 1 or len(candidates) > 1:
+        return "ambiguous" if elapsed > 2 else None
+    if len(candidates) == 1 and result["confirmed"] and fresh:
+        return "verified"
+    if elapsed <= 4:
+        return None
+    if not fresh:
+        return "service_unavailable"
+    if not candidates:
+        return "missing_ble" if not visible_tags else "unknown_tag"
+    similarity = result.get("similarity")
+    if warning or (similarity is not None and similarity >= threshold):
+        return "timeout"
+    return "face_mismatch"
+
+
+def resolve_overlay_stage(outcome, person, is_triggered, gate, warning, candidates):
+    """Determine UI stage and human-readable status label for a tracked face."""
+    default_prompt = "Verifying" if candidates else "Waiting for assigned BLE tag"
+    if outcome == "verified" and person:
+        return "verified", person["name"]
+    if outcome:
+        return "denied", warning or default_prompt
+    if is_triggered:
+        return "evaluating", warning or default_prompt
+    if not gate["kinematics_ready"]:
+        label = (
+            "Passerby ignored"
+            if gate["is_lateral_passerby"]
+            else "Outside approach zone"
+        )
+        return "bystander", label
+    return "approaching", f"Approaching · {gate['distance_m']:.1f}m"
 
 
 class Monitor:
@@ -323,6 +381,7 @@ class Monitor:
         self.photo_cache = runtime / "reference_photos"
         self.photo_cache.mkdir(mode=0o700, exist_ok=True)
         self.visible = []
+        self.active_candidates = []
         self.frames = 0
         self.pipeline = VideoPipeline(
             runtime, load_settings(ROOT / "data", dict(DEFAULTS))
@@ -446,6 +505,7 @@ class Monitor:
                 direction=self.direction,
                 latest=self.latest,
                 tags=self.visible,
+                candidates=getattr(self, "active_candidates", []),
                 queued=self.outbox.count(),
                 frames=self.frames,
                 preview_fps=self.buffer.fps(),
@@ -526,56 +586,46 @@ class Monitor:
     def tag_list(self):
         now = time.monotonic()
         visible = []
-        from ble_scanner import BLE_RESULT_TTL, MFG_COMPANY_ID
+        from services.recognition.ble_scanner import BLE_RESULT_TTL, MFG_COMPANY_ID
 
         for item in self.scanner.latest_results.values():
             if now - item.timestamp > BLE_RESULT_TTL:
                 continue
             payload = item.mfr_data.get(MFG_COMPANY_ID)
-            label = (
-                payload.decode("utf-8", errors="ignore").strip().lower()
-                if payload
-                else (item.uuids[0] if item.uuids else "")
-            )
+            label = ""
+            if payload:
+                # Prune angle brackets (<, >) and non-printable control characters
+                decoded = "".join(
+                    c for c in payload.decode("utf-8", errors="ignore")
+                    if 32 <= ord(c) < 127 and c not in "<>"
+                ).strip().lower()
+                if decoded and any(c.isalnum() for c in decoded):
+                    label = decoded
+            elif item.uuids:
+                u = item.uuids[0].strip().lower()
+                cleaned_u = "".join(c for c in u if c in "0123456789abcdef-")
+                if cleaned_u:
+                    label = cleaned_u
             if label:
                 visible.append(dict(tag=label, rssi=item.rssi))
         self.visible = visible
-        return [
+        candidates = [
             p
             for p in self.gallery
             if p.get("ble_tag")
             and verify_tag(p["ble_tag"], self.scanner.latest_results)
         ]
+        self.active_candidates = [
+            dict(id=p["id"], name=p["name"], ble_tag=p.get("ble_tag"))
+            for p in candidates
+        ]
+        return candidates
 
     def ble_state(self):
         self.tag_list()
         return dict(self.scanner.state(), tags=self.visible)
 
-    def process(self, frame):
-        self.initialize()
-        _, faces = self.detector.detect(frame)
-        faces = [] if faces is None else faces
-        now = time.monotonic()
-        assign = self.pipeline.associate(faces, now, (frame.shape[1], frame.shape[0]))
-        candidates = self.tag_list()
-        if not self.current_processing_session():
-            return
-        # Show detections while the first embedding/decision is being computed.
-        with self.lock:
-            self.overlays = [
-                dict(
-                    box=face[:4].astype(float).tolist(),
-                    label="Verifying" if candidates else "Waiting for assigned BLE tag",
-                    confirmed=False,
-                )
-                for face in faces
-            ]
-            self.overlay_size = [frame.shape[1], frame.shape[0]]
-            self.overlay_time = time.monotonic()
-        overlays = []
-        trajectories = getattr(self, "trajectories", None)
-        if trajectories is None:
-            trajectories = self.trajectories = defaultdict(lambda: deque(maxlen=16))
+    def _prune_stale_tracks(self, trajectories):
         for track in list(self.first) + list(trajectories):
             if track not in self.pipeline.last_seen:
                 self.first.pop(track, None)
@@ -583,25 +633,12 @@ class Monitor:
                 trajectories.pop(track, None)
                 self.best_captures.pop(track, None)
                 self.logged.discard(track)
-        for index, face in enumerate(faces):
-            track = assign.get(index)
-            if track is None:
-                continue
-            gate = evaluate_hybrid_gate(
-                face, frame.shape, trajectories[track], self.settings, now
-            )
-            is_triggered = gate["triggered"]
-            if is_triggered:
-                self.first.setdefault(track, now)
-            else:
-                self.first.pop(track, None)
-            quality = quality_metrics(frame, face)
-            warning = rejection(quality, self.settings)
-            history = self.samples[track]
-            signature = tuple(p["id"] for p in candidates)
-            # Candidate changes cannot reuse evidence from a previous BLE identity.
-            previous = getattr(self, "candidate_signature", None)
-            if previous != signature:
+
+    def _sync_candidate_signature(self, candidates):
+        signature = tuple(sorted(p["id"] for p in candidates))
+        previous = getattr(self, "candidate_signature", None)
+        if previous is not None and signature and previous != signature:
+            if not set(previous).intersection(set(signature)):
                 self.samples.clear()
                 self.best_captures.clear()
                 history = self.samples[track]
@@ -743,9 +780,78 @@ class Monitor:
                     else "Outside approach zone"
                 )
             else:
-                stage = "approaching"
-                label = f"Approaching · {gate['distance_m']:.1f}m"
+                self.first.pop(track, None)
+            quality = quality_metrics(frame, face)
+            warning = rejection(quality, self.settings)
+            tracked_items.append((index, track, face, gate, quality, warning))
 
+        # Only faces triggered inside the active approach corridor compete for passage
+        competing_faces = sum(1 for item in tracked_items if item[3]["triggered"])
+
+        # Batch ArcFace feature extraction when multiple valid faces are ready
+        ready_indices = [
+            i for i, item in enumerate(tracked_items)
+            if item[5] is None and item[3]["kinematics_ready"]
+        ]
+        extracted_vectors = {}
+        if len(ready_indices) > 1 and isinstance(self.recognizer, ArcFace):
+            crops = [
+                self.recognizer.alignCrop(frame, tracked_items[i][2])
+                for i in ready_indices
+            ]
+            batch_vecs = self.recognizer.features(crops)
+            for i, vec in zip(ready_indices, batch_vecs):
+                extracted_vectors[i] = vec.flatten()
+        else:
+            for i in ready_indices:
+                face = tracked_items[i][2]
+                extracted_vectors[i] = self.recognizer.feature(
+                    self.recognizer.alignCrop(frame, face)
+                ).flatten()
+
+        people = [
+            dict(p, reference=np.asarray(p["reference"], np.float32))
+            for p in candidates
+        ]
+        full_gallery = getattr(self, "gallery", None)
+        fresh = now - self.last_gallery < 30
+        person = candidates[0] if len(candidates) == 1 else None
+        overlays = []
+
+        for list_idx, (_, track, face, gate, quality, warning) in enumerate(tracked_items):
+            is_triggered = gate["triggered"]
+            if list_idx in extracted_vectors:
+                self._record_sample(
+                    track, frame, face, extracted_vectors[list_idx], quality, now
+                )
+            history = self.samples[track]
+            result = decision(history, people, self.settings, now, gallery=full_gallery)
+            if history and now - history[-1]["time"] > TRACK_CONFIRMATION_TTL:
+                result["confirmed"] = False
+
+            effective_warning = warning or (
+                None if result["confirmed"] else pose_guidance(quality)
+            )
+            elapsed = (now - self.first[track]) if is_triggered else 0.0
+            outcome = evaluate_verification_outcome(
+                is_triggered=is_triggered,
+                competing_faces=competing_faces,
+                candidates=candidates,
+                visible_tags=self.visible,
+                result=result,
+                warning=effective_warning,
+                fresh=fresh,
+                elapsed=elapsed,
+                threshold=self.settings["threshold"],
+            )
+            if not self.current_processing_session():
+                return
+            if outcome and track not in self.logged:
+                self._record_event(track, frame, face, outcome, person, result, now)
+
+            stage, label = resolve_overlay_stage(
+                outcome, person, is_triggered, gate, effective_warning, candidates
+            )
             overlays.append(
                 dict(
                     box=face[:4].astype(float).tolist(),
@@ -758,6 +864,7 @@ class Monitor:
                     kinematics_ready=gate["kinematics_ready"],
                 )
             )
+
         if not self.current_processing_session():
             return
         with self.lock:

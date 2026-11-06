@@ -2,13 +2,18 @@
 import json
 import os
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 import tempfile
 
 import cv2
 import numpy as np
 
-import app as service
-from face_models import EMBEDDING_SIZE, MODEL_ID, PROFILE_NAME
+from services.recognition.face_models import ArcFace, EMBEDDING_SIZE, MODEL_ID, PROFILE_NAME, RetinaFace, TOTAL_ENROLLMENT_SAMPLES, reference_embedding
+
 
 
 def rebuild_folder(engine, folder):
@@ -17,8 +22,8 @@ def rebuild_folder(engine, folder):
         raise ValueError("Linked profiles are not supported.")
     if target.exists():
         with np.load(target, allow_pickle=False) as profile:
-            if str(profile['model_id'].item()) == MODEL_ID and profile['features'].shape == (service.TOTAL, EMBEDDING_SIZE):
-                service.reference_embedding(profile['features'])
+            if str(profile['model_id'].item()) == MODEL_ID and profile['features'].shape == (TOTAL_ENROLLMENT_SAMPLES, EMBEDDING_SIZE):
+                reference_embedding(profile['features'])
                 return 'already converted'
         raise ValueError('An incompatible ArcFace archive exists. Preserve it elsewhere before rebuilding.')
     metadata_path = folder / 'metadata.json'
@@ -29,7 +34,7 @@ def rebuild_folder(engine, folder):
     name = metadata['name']
     if not isinstance(name, str) or not 1 <= len(name.strip()) <= 60:
         raise ValueError('Invalid person name.')
-    if not isinstance(names, list) or len(names) != service.TOTAL or len(set(names)) != service.TOTAL:
+    if not isinstance(names, list) or len(names) != TOTAL_ENROLLMENT_SAMPLES or len(set(names)) != TOTAL_ENROLLMENT_SAMPLES:
         raise ValueError('Expected 40 distinct enrollment images.')
     features = []
     for filename in names:
@@ -52,7 +57,7 @@ def rebuild_folder(engine, folder):
             temporary = Path(output.name)
             os.chmod(temporary, 0o600)
             np.savez_compressed(output, name=name.strip(), features=features, model_id=MODEL_ID,
-                                reference_embedding=service.reference_embedding(features),
+                                reference_embedding=reference_embedding(features),
                                 registration_directory=f'registration/{folder.name}')
         temporary.replace(target)
     finally:
@@ -62,10 +67,23 @@ def rebuild_folder(engine, folder):
 
 
 def main():
-    engine = service.FaceEngine()
-    engine.initialize()
+    models_dir = ROOT / "models"
+    detector = RetinaFace(models_dir / "retinaface_r34.onnx")
+    recognizer = ArcFace(models_dir / "w600k_r50.onnx")
+
+    class Engine:
+        def __init__(self, d, r):
+            self.detector = d
+            self.recognizer = r
+
+        def feature(self, frame, face):
+            return self.recognizer.feature(self.recognizer.alignCrop(frame, face))
+
+    engine = Engine(detector, recognizer)
+
     failures = 0
-    folders = sorted(service.REGISTRATIONS.iterdir()) if service.REGISTRATIONS.exists() else []
+    registrations_dir = ROOT / "registration"
+    folders = sorted(registrations_dir.iterdir()) if registrations_dir.exists() else []
     for folder in folders:
         if not folder.is_dir() or folder.is_symlink() or folder.name.startswith('.'):
             continue

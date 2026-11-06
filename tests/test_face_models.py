@@ -5,7 +5,15 @@ from unittest.mock import Mock, patch
 import cv2
 import numpy as np
 
-from face_models import ARCFACE_POINTS, RetinaFace, ArcFace, alignment_matrix
+from services.recognition.face_models import (
+    ARCFACE_POINTS,
+    ArcFace,
+    RetinaFace,
+    alignment_matrix,
+    fast_nms,
+    pose_exemplars,
+    reference_embedding,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,7 +32,7 @@ class InferenceTests(unittest.TestCase):
     def test_retinaface_decodes_boxes_landmarks_and_removes_duplicate(self):
         fake = Mock()
         fake.get_inputs.return_value = [Mock(name='input')]
-        with patch('face_models.session', return_value=fake):
+        with patch('services.recognition.face_models.session', return_value=fake):
             detector = RetinaFace('unused.onnx')
         count = len(detector.priors)
         loc = np.zeros((1, count, 4), np.float32)
@@ -48,7 +56,7 @@ class InferenceTests(unittest.TestCase):
         fake = Mock()
         fake.get_inputs.return_value = [Mock(name='input')]
         fake.run.return_value = [np.ones((1, 512), np.float32)]
-        with patch('face_models.session', return_value=fake):
+        with patch('services.recognition.face_models.session', return_value=fake):
             recognizer = ArcFace('unused.onnx')
         image = np.full((112, 112, 3), [0, 127, 255], np.uint8)
         vector = recognizer.feature(image)
@@ -58,6 +66,30 @@ class InferenceTests(unittest.TestCase):
         fake.run.return_value = [np.zeros((1, 512), np.float32)]
         with self.assertRaises(RuntimeError):
             recognizer.feature(image)
+
+    def test_fast_nms_batched_features_and_pose_exemplars(self):
+        boxes = np.array([[10, 10, 50, 50], [12, 12, 50, 50], [200, 200, 40, 40]], dtype=np.float32)
+        scores = np.array([0.9, 0.8, 0.85], dtype=np.float32)
+        keep = fast_nms(boxes, scores, 0.4)
+        np.testing.assert_array_equal(keep, [0, 2])
+
+        fake = Mock()
+        fake.get_inputs.return_value = [Mock(name='input')]
+        fake.run.return_value = [np.ones((2, 512), np.float32)]
+        with patch('services.recognition.face_models.session', return_value=fake):
+            recognizer = ArcFace('unused.onnx')
+        crop = np.full((112, 112, 3), 120, dtype=np.uint8)
+        batched = recognizer.features([crop, crop])
+        self.assertEqual(batched.shape, (2, 512))
+        np.testing.assert_allclose(np.linalg.norm(batched, axis=1), [1.0, 1.0], atol=1e-6)
+
+        # 40 samples across 5 poses produce 5 distinct normalized pose exemplars
+        samples = np.zeros((40, 512), dtype=np.float32)
+        for p_idx in range(5):
+            samples[p_idx * 8 : (p_idx + 1) * 8, p_idx] = 1.0
+        exemplars = pose_exemplars(samples)
+        self.assertEqual(exemplars.shape, (5, 512))
+        np.testing.assert_allclose(np.linalg.norm(exemplars, axis=1), np.ones(5), atol=1e-6)
 
 
 if __name__ == '__main__':

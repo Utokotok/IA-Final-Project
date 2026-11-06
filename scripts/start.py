@@ -76,7 +76,7 @@ if missing:
     raise SystemExit(
         "Missing dependencies: "
         + ", ".join(missing)
-        + ". Run 'pip install -r requirements-revision.txt'"
+        + ". Run 'pip install -r requirements.txt'"
     )
 
 # Start PostgreSQL if configured
@@ -122,6 +122,20 @@ python_exe = get_python_exe()
 use_https = config.get("https", False)
 is_foreground = "-f" in sys.argv or "--foreground" in sys.argv
 
+# Ensure newly built frontend assets are synced to static root
+frontend_dist = ROOT / "frontend" / "dist"
+if frontend_dist.exists():
+    try:
+        subprocess.run(
+            [python_exe, str(BACKEND / "manage.py"), "collectstatic", "--noinput"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=ROOT,
+        )
+    except Exception:
+        pass
+
 env = {
     **os.environ,
     "PYTHONUNBUFFERED": "1",
@@ -144,7 +158,7 @@ waitress_cmd.append("config.wsgi:application")
 
 commands = {
     "backend": (waitress_cmd, BACKEND),
-    "recognition": ([python_exe, str(ROOT / "revision" / "worker.py")], ROOT),
+    "recognition": ([python_exe, str(ROOT / "services" / "recognition" / "worker.py")], ROOT),
 }
 
 if use_https:

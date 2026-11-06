@@ -11,9 +11,13 @@ import uuid
 import cv2
 import numpy as np
 
+from services.recognition.enrollment_core import pose_ratios, sharpness_score
+
 _font_cache = None
 
-DEFAULTS = dict(sharpness=20., min_size=100., max_yaw=.35, threshold=.60, margin=.04, min_samples=3)
+MIN_DETECTION_CONFIDENCE = .72
+SOFT_YAW_LIMIT = .35
+DEFAULTS = dict(sharpness=20., min_size=100., max_yaw=.58, threshold=.60, margin=.04, min_samples=3)
 
 
 def quality_metrics(frame, face):
@@ -26,20 +30,16 @@ def quality_metrics(frame, face):
     if crop.size == 0:
         return None
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    normalized = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_AREA)
-    eyes = face[4:8].reshape(2, 2)
-    span = max(float(np.linalg.norm(eyes[1]-eyes[0])), 1.)
-    direction = (eyes[np.argmax(eyes[:, 0])] - eyes[np.argmin(eyes[:, 0])]) / span
-    yaw = abs(float((face[8:10] - eyes.mean(0)) @ direction) / span)
-    return dict(sharpness=float(cv2.Laplacian(normalized, cv2.CV_64F).var()),
-                size=min(w, h), yaw=yaw, brightness=float(gray.mean()),
+    yaw, _ = pose_ratios(face)
+    return dict(sharpness=sharpness_score(gray),
+                size=min(w, h), yaw=abs(yaw), brightness=float(gray.mean()),
                 confidence=float(face[14]), overexposed=float((gray > 250).mean()))
 
 
 def rejection(metrics, settings):
     if metrics is None:
         return 'Move closer and keep your entire face visible.'
-    if metrics['confidence'] < .8:
+    if metrics['confidence'] < MIN_DETECTION_CONFIDENCE:
         return 'Detection confidence is low. Face the camera more directly.'
     if metrics['size'] < settings['min_size']:
         return 'Move closer; your face is too small.'
@@ -52,11 +52,37 @@ def rejection(metrics, settings):
     return None
 
 
+def pose_guidance(metrics):
+    """Return a non-blocking pose hint when yaw exceeds the frontal comfort zone."""
+    if metrics is not None and metrics['yaw'] > SOFT_YAW_LIMIT:
+        return 'Turn your face toward the camera.'
+    return None
+
+
 def quality_weight(metrics):
     return max(.01, min(metrics['sharpness']/100, 1) * min(metrics['size']/180, 1) * max(.1, 1-metrics['yaw']))
 
 
-def decision(samples, people, settings, now):
+def _score_person(vectors, mean_unit, person, weights=None):
+    """Compute aggregate and per-sample cosine similarity across reference and optional pose exemplars."""
+    ref = np.asarray(person['reference'], dtype=np.float32)
+    agg_score = float(ref @ mean_unit)
+    ind_scores = vectors @ ref
+    exemplars = person.get('exemplars')
+    if exemplars is not None and len(exemplars):
+        ex_mat = np.asarray(exemplars, dtype=np.float32)
+        if ex_mat.ndim == 2 and ex_mat.shape[1] == mean_unit.shape[0]:
+            ind_scores = np.maximum(ind_scores, np.max(vectors @ ex_mat.T, axis=1))
+            weighted_ind = (
+                float(np.average(ind_scores, weights=weights))
+                if weights is not None
+                else float(np.mean(ind_scores))
+            )
+            agg_score = max(agg_score, float(np.max(ex_mat @ mean_unit)), weighted_ind)
+    return agg_score, ind_scores
+
+
+def decision(samples, people, settings, now, gallery=None):
     """Select diverse recent views, aggregate and demand agreeing individual matches."""
     usable = [s for s in samples if 0 <= now-s['time'] <= 6 and rejection(s['quality'], settings) is None]
     usable = sorted(usable, key=lambda s: quality_weight(s['quality']), reverse=True)[:8]
@@ -69,19 +95,37 @@ def decision(samples, people, settings, now):
     norm = float(np.linalg.norm(mean))
     if norm < 1e-8:
         return empty
-    templates = np.stack([p['reference'] for p in people])
-    scores = templates @ (mean / norm)
+    mean_unit = mean / norm
+
+    if any(p.get('exemplars') is not None for p in people):
+        pairs = [_score_person(vectors, mean_unit, p, weights=weights) for p in people]
+        scores = np.array([pair[0] for pair in pairs], dtype=np.float32)
+        individual = np.stack([pair[1] for pair in pairs], axis=1)
+    else:
+        templates = np.stack([np.asarray(p['reference'], dtype=np.float32) for p in people])
+        scores = templates @ mean_unit
+        individual = vectors @ templates.T
+
     best = int(np.argmax(scores))
+    best_id = people[best]['id']
     score = float(scores[best])
     runner_up = float(np.partition(scores, -2)[-2]) if len(scores) > 1 else -1.
-    individual = vectors @ templates.T
+
+    if gallery:
+        for other in gallery:
+            if other['id'] == best_id:
+                continue
+            other_score, _ = _score_person(vectors, mean_unit, other, weights=weights)
+            if other_score > runner_up:
+                runner_up = other_score
+
     agreeing = ((individual.argmax(1) == best) & (individual[:, best] >= settings['threshold'])).sum()
     confirmed = (len(usable) >= settings['min_samples']
                  and score >= settings['threshold']
                  and score-runner_up >= settings['margin']
                  and agreeing >= settings['min_samples'])
-    return dict(person_id=people[best]['id'] if confirmed else None,
-                candidate_id=people[best]['id'] if score >= settings['threshold'] else None,
+    return dict(person_id=best_id if confirmed else None,
+                candidate_id=best_id if score >= settings['threshold'] else None,
                 similarity=score,
                 sample_count=len(usable),
                 confirmed=bool(confirmed))
@@ -125,8 +169,8 @@ class VideoPipeline:
             os.environ.setdefault('MPLCONFIGDIR', _font_cache.name)
             import supervision as sv
             self.sv = sv
-            self.tracker = sv.ByteTrack(track_activation_threshold=.85, lost_track_buffer=45,
-                                        frame_rate=7, minimum_consecutive_frames=1)
+            self.tracker = sv.ByteTrack(track_activation_threshold=MIN_DETECTION_CONFIDENCE, lost_track_buffer=45,
+                                        frame_rate=15, minimum_consecutive_frames=1)
         if self.last_time is not None and (now-self.last_time > 2.5 or frame_size != self.frame_size):
             self.reset()
         self.last_time, self.frame_size = now, frame_size

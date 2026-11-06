@@ -10,7 +10,7 @@ from django.db import transaction
 from django.utils.dateparse import parse_datetime
 
 from access.models import FaceProfile, Personnel, Verification
-from face_models import MODEL_ID, PROFILE_NAME
+from services.recognition.face_models import MODEL_ID, PROFILE_NAME
 
 
 class Command(BaseCommand):

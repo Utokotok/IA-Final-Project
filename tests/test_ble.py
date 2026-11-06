@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from ble_scanner import BLE_RESULT_TTL, AdvertisementCache, BLEScanner, verify_tag
+from services.recognition.ble_scanner import BLE_RESULT_TTL, AdvertisementCache, BLEScanner, verify_tag
 
 
 def advertisement(tag=b"tag-one", rssi=-60):
@@ -31,7 +31,7 @@ class FreshnessTests(unittest.TestCase):
         scanner = BLEScanner()
         scanner._apply_update({"devices": devices, "scanning": True}, now=11)
         self.assertEqual(scanner.latest_results["A"].timestamp, 10)
-        with patch("ble_scanner.time.monotonic", return_value=11):
+        with patch("services.recognition.ble_scanner.time.monotonic", return_value=11):
             self.assertTrue(verify_tag("tag-one", scanner.latest_results))
         scanner._apply_update({"devices": devices, "scanning": True}, now=14)
         self.assertEqual(scanner.latest_results, {})
@@ -52,7 +52,7 @@ class FreshnessTests(unittest.TestCase):
             {"devices": cache.snapshot(now=11), "scanning": True}, now=11
         )
         self.assertEqual(scanner.latest_results.keys(), {"A"})
-        with patch("ble_scanner.time.monotonic", return_value=11):
+        with patch("services.recognition.ble_scanner.time.monotonic", return_value=11):
             self.assertFalse(verify_tag("tag-one", scanner.latest_results))
 
     def test_registration_can_request_refresh_while_continuous_scan_is_active(self):
@@ -81,7 +81,7 @@ class FreshnessTests(unittest.TestCase):
 
 class ContinuousWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_scanner_publishes_repeatedly_until_cancelled(self):
-        from ble_scanner import _worker_async_loop
+        from services.recognition.ble_scanner import _worker_async_loop
 
         messages = []
         received = asyncio.Event()
@@ -109,8 +109,8 @@ class ContinuousWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bleak.BleakScanner", FakeScanner),
-            patch("ble_scanner.BLE_UPDATE_INTERVAL", 0.02),
-            patch("ble_scanner.sys.stdin", io.StringIO("")),
+            patch("services.recognition.ble_scanner.BLE_UPDATE_INTERVAL", 0.02),
+            patch("services.recognition.ble_scanner.sys.stdin", io.StringIO("")),
             patch("builtins.print", capture),
         ):
             task = asyncio.create_task(_worker_async_loop())

@@ -1166,6 +1166,11 @@ hr {
   background: #101d2cbb;
   padding: 8px 10px;
   border-radius: 5px;
+  backdrop-filter: blur(4px);
+  max-width: 75%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .decision-panel {
   padding: 20px;

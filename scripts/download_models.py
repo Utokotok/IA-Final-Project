@@ -9,7 +9,7 @@ import zipfile
 
 import certifi
 
-ROOT = Path(__file__).resolve().parent / 'models'
+ROOT = Path(__file__).resolve().parents[1] / 'models'
 TLS = ssl.create_default_context(cafile=certifi.where())
 
 

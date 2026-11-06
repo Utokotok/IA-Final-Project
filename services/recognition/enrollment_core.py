@@ -14,8 +14,11 @@ if not np.isfinite(BLUR_THRESHOLD) or BLUR_THRESHOLD < 0:
 
 
 def sharpness_score(gray):
-    """Measure edges at a fixed scale so larger crops aren't penalized."""
+    """Measure edges at a fixed scale while suppressing low-light sensor grain."""
     normalized = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_AREA)
+    if float(normalized.mean()) < 55.0:
+        # Suppress high-ISO CMOS grain in dark frames so noise does not fake sharpness
+        normalized = cv2.GaussianBlur(normalized, (3, 3), 0.6)
     return float(cv2.Laplacian(normalized, cv2.CV_64F).var())
 
 
@@ -41,7 +44,7 @@ def face_quality(frame, face):
 
 
 def pose_ratios(face):
-    """Coarse pose cues from five facial landmarks, not calibrated degrees."""
+    """Roll-compensated coarse pose cues from five facial landmarks."""
     eyes = face[4:8].reshape(2, 2)
     nose = face[8:10]
     mouth = face[10:14].reshape(2, 2).mean(axis=0)
