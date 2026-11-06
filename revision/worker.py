@@ -698,6 +698,7 @@ class Monitor:
                         if person
                         else None,
                         settings=self.settings,
+                        sample_count=result.get("sample_count", 0),
                     ),
                 )
                 self.outbox.add(event)
